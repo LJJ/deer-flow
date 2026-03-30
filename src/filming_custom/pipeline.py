@@ -57,17 +57,51 @@ def resolve_elements(
 # 4.2 Prompt 组装
 # ---------------------------------------------------------------------------
 
-def compose_prompt(segment: Segment, element_list: list[dict[str, str]]) -> str:
-    """将 segment 的 prompt 中的角色名替换为 <<<element_N>>> 标记。
+CHARACTER_DISPLAY_NAMES = {
+    "songyu": "宋玉",
+    "ziling": "紫灵",
+}
 
-    element_list 顺序决定 N 的编号（从 1 开始）。
-    """
-    prompt = segment.prompt
+
+def _replace_names(text: str, element_list: list[dict[str, str]]) -> str:
+    """将文本中的角色名（character_id 和中文名）替换为 <<<element_N>>> 标记。"""
     for i, elem in enumerate(element_list, 1):
-        char_name = elem["name"]
-        # 替换中文名或 character_id
-        prompt = prompt.replace(char_name, f"<<<element_{i}>>>")
-    return prompt
+        marker = f"<<<element_{i}>>>"
+        cid = elem["name"]
+        text = text.replace(cid, marker)
+        display = CHARACTER_DISPLAY_NAMES.get(cid)
+        if display:
+            text = text.replace(display, marker)
+    return text
+
+
+def compose_prompt(segment: Segment, element_list: list[dict[str, str]]) -> str:
+    """将 SegmentPlan 的 shots 结构拼成 KlingAI 中文镜头格式。
+
+    输出格式示例：
+      现代都市，傍晚暖光。宋玉家客厅，阳光从窗户照进来，餐桌上摆着面包和零食。
+
+      镜头1，3s，中景，<<<element_1>>>坐在餐桌前，手撑着头，慵懒地嚼着面包
+      镜头2，4s，近景，<<<element_2>>>从纸袋里拿出巧克力面包咬了一口，眼睛亮了
+    """
+    lines = []
+
+    # 场景描述行
+    scene = _replace_names(segment.scene_description, element_list)
+    lines.append(scene)
+    lines.append("")
+
+    # 镜头行：按 shots 数组构建
+    if segment.shots:
+        for shot in segment.shots:
+            dur = f"{int(shot.duration_seconds)}s"
+            desc = _replace_names(shot.shot_prompt, element_list)
+            lines.append(f"镜头{shot.shot_index + 1}，{dur}，{shot.scale}，{desc}")
+    else:
+        # fallback：如果没有 shots，用 segment.prompt 整段描述
+        lines.append(_replace_names(segment.prompt, element_list))
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
