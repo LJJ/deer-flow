@@ -9,6 +9,28 @@ from deerflow.subagents.config import SubagentConfig
 
 logger = logging.getLogger(__name__)
 
+# Extension point: external code can register additional subagents here.
+# Usage: from deerflow.subagents.registry import register_subagents
+#        register_subagents({"my-agent": my_config})
+_external_subagents: dict[str, SubagentConfig] = {}
+
+
+def register_subagents(configs: dict[str, SubagentConfig]) -> None:
+    """Register external subagent configurations.
+
+    This allows code outside the deerflow package to add custom subagents
+    without modifying the built-in registry.
+    """
+    _external_subagents.update(configs)
+    logger.info("Registered %d external subagent(s): %s", len(configs), list(configs.keys()))
+
+
+def _all_subagents() -> dict[str, SubagentConfig]:
+    """Return merged dict of built-in + external subagents."""
+    if not _external_subagents:
+        return BUILTIN_SUBAGENTS
+    return {**BUILTIN_SUBAGENTS, **_external_subagents}
+
 
 def get_subagent_config(name: str) -> SubagentConfig | None:
     """Get a subagent configuration by name, with config.yaml overrides applied.
@@ -19,7 +41,7 @@ def get_subagent_config(name: str) -> SubagentConfig | None:
     Returns:
         SubagentConfig if found (with any config.yaml overrides applied), None otherwise.
     """
-    config = BUILTIN_SUBAGENTS.get(name)
+    config = _all_subagents().get(name)
     if config is None:
         return None
 
@@ -41,7 +63,7 @@ def list_subagents() -> list[SubagentConfig]:
     Returns:
         List of all registered SubagentConfig instances.
     """
-    return [get_subagent_config(name) for name in BUILTIN_SUBAGENTS]
+    return [get_subagent_config(name) for name in _all_subagents()]
 
 
 def get_subagent_names() -> list[str]:
@@ -50,7 +72,7 @@ def get_subagent_names() -> list[str]:
     Returns:
         List of subagent names.
     """
-    return list(BUILTIN_SUBAGENTS.keys())
+    return list(_all_subagents().keys())
 
 
 def get_available_subagent_names() -> list[str]:
@@ -59,11 +81,11 @@ def get_available_subagent_names() -> list[str]:
     Returns:
         List of subagent names visible to the current sandbox configuration.
     """
-    names = list(BUILTIN_SUBAGENTS.keys())
+    names = list(_all_subagents().keys())
     try:
         host_bash_allowed = is_host_bash_allowed()
     except Exception:
-        logger.debug("Could not determine host bash availability; exposing all built-in subagents")
+        logger.debug("Could not determine host bash availability; exposing all subagents")
         return names
 
     if not host_bash_allowed:
