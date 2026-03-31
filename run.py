@@ -434,7 +434,6 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
 
                 if result["status"] == "completed":
                     video_url = result["result"]["url"]
-                    # 下载视频
                     dest = os.path.join(tmp_dir, f"segment_{task['seg'].get('segment_index', 0)}.mp4")
                     dl_resp = httpx.get(video_url, timeout=120)
                     with open(dest, "wb") as f:
@@ -444,10 +443,10 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
                     logger.info("segment %d 完成: %s", task["seg"].get("segment_index", 0), dest)
                     break
                 elif result["status"] == "failed":
-                    logger.error("segment %d 失败: %s", task["seg"].get("segment_index", 0), result.get("error", ""))
-                    return {"success": False, "error": result.get("error", "segment failed")}
+                    logger.warning("segment %d 失败（跳过）: %s", task["seg"].get("segment_index", 0), result.get("error", ""))
+                    break
             else:
-                return {"success": False, "error": f"segment {task['seg'].get('segment_index', 0)} polling timeout"}
+                logger.warning("segment %d 轮询超时（跳过）", task["seg"].get("segment_index", 0))
 
         if not video_paths:
             return {"success": False, "error": "no videos generated"}
