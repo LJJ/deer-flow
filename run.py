@@ -34,6 +34,46 @@ if env_path.exists():
 
 OPENFANG_HOME = os.environ.get("OPENFANG_HOME", str(Path(__file__).parent.parent / ".openfang"))
 SKILLS_DIR = Path(__file__).parent / "skills" / "custom"
+OPENFANG_API = os.environ.get("OPENFANG_API", "http://127.0.0.1:4200")
+
+
+# ── Tracing ──────────────────────────────────────────────────────
+
+import uuid as _uuid
+
+_current_trace_id: str | None = None
+
+
+def _start_trace() -> str:
+    """创建 filming trace，返回 trace_id"""
+    global _current_trace_id
+    _current_trace_id = f"filming-{_uuid.uuid4().hex[:12]}"
+    logger.info("trace: %s", _current_trace_id)
+    return _current_trace_id
+
+
+def _report_span(name: str, kind: str = "custom", input_text: str = "", output_text: str = "",
+                 duration_ms: int | None = None, error: str | None = None, metadata: dict | None = None) -> None:
+    """上报 span 到 OpenFang trace 系统"""
+    if not _current_trace_id:
+        return
+    try:
+        import httpx
+        now = datetime.now(timezone.utc).isoformat()
+        body = {
+            "name": f"filming:{name}",
+            "kind": kind,
+            "started_at": now,
+            "ended_at": now,
+            "duration_ms": duration_ms,
+            "input": input_text[:10000] if input_text else None,
+            "output": (f"[error] {error}" if error else output_text[:10000]) if (error or output_text) else None,
+            "metadata_json": json.dumps(metadata or {}, ensure_ascii=False),
+        }
+        httpx.post(f"{OPENFANG_API}/api/traces/{_current_trace_id}/spans",
+                   json=body, timeout=5)
+    except Exception:
+        pass  # fire-and-forget
 
 # ── Skill 加载 ──────────────────────────────────────────────────────
 
@@ -304,17 +344,23 @@ def step_screenplay(events: list[dict]) -> dict | None:
         user += f"\n\n已拍摄过的时间段（请跳过）：\n{dedup}"
 
     logger.info("编剧: %d events, calling LLM...", len(sampled))
+    t0 = time.time()
     result_text = _call_llm(system, user)
+    duration = int((time.time() - t0) * 1000)
     result = _extract_json(result_text)
 
     if not result:
+        _report_span("screenplay", "llm_aux", input_text=user[:2000], error="JSON parse failed", duration_ms=duration)
         logger.error("编剧返回无法解析: %s", result_text[:300])
         return None
 
     if result.get("skip"):
+        _report_span("screenplay", "llm_aux", input_text=user[:2000], output_text=f"skip: {result.get('reason','')}", duration_ms=duration)
         logger.info("编剧: skip — %s", result.get("reason", ""))
         return None
 
+    _report_span("screenplay", "llm_aux", input_text=user[:2000], output_text=json.dumps(result, ensure_ascii=False)[:5000], duration_ms=duration,
+                 metadata={"logline": result.get("logline",""), "segments": len(result.get("segments",[]))})
     logger.info("编剧完成: %s | %d segments", result.get("logline", "")[:80], len(result.get("segments", [])))
     return result
 
@@ -337,13 +383,18 @@ def step_cinematography(screenplay: dict, wardrobe_summary: dict) -> dict | None
 按剧本设计每段分镜，输出 SegmentPlan JSON。"""
 
     logger.info("摄影设计: calling LLM...")
+    t0 = time.time()
     result_text = _call_llm(system, user)
+    duration = int((time.time() - t0) * 1000)
     result = _extract_json(result_text)
 
     if not result or "segments" not in result:
+        _report_span("cinematography", "llm_aux", input_text=user[:2000], error="invalid response", duration_ms=duration)
         logger.error("摄影设计返回无效: %s", result_text[:500])
         return None
 
+    _report_span("cinematography", "llm_aux", input_text=user[:2000], output_text=json.dumps(result, ensure_ascii=False)[:5000], duration_ms=duration,
+                 metadata={"segments": len(result["segments"])})
     logger.info("摄影设计完成: %d segments", len(result["segments"]))
     return result
 
@@ -413,7 +464,10 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
             if ref_images:
                 body["reference_images"] = ref_images[:1]  # StarVideo 单张参考图
 
-            logger.info("提交 segment %d via %s (%ds)", seg.get("segment_index", 0), provider, body["duration"])
+            _report_span(f"segment_{seg.get('segment_index',0)}_submit", "custom",
+                         input_text=prompt, metadata={"provider": provider, "duration": body["duration"],
+                                                       "ref_images": len(ref_images)})
+            logger.info("提交 segment %d via %s (%ds)\nprompt:\n%s", seg.get("segment_index", 0), provider, body["duration"], prompt)
             resp = httpx.post(f"{MEDIA_SERVICE_URL}/video/generate", json=body, timeout=30)
             resp.raise_for_status()
             task_info = resp.json()
@@ -426,6 +480,7 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
             task_id = task["taskId"]
             task_provider = task["provider"]
             logger.info("轮询 segment %d task=%s", task["seg"].get("segment_index", 0), task_id)
+            poll_start = time.time()
 
             for _ in range(120):  # 最多 20 分钟
                 time.sleep(10)
@@ -440,12 +495,21 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
                         f.write(dl_resp.content)
                     video_paths.append(dest)
                     prompts.append(task["prompt"])
+                    _report_span(f"segment_{task['seg'].get('segment_index',0)}_done", "custom",
+                                 output_text=video_url[:200], duration_ms=int((time.time() - poll_start) * 1000),
+                                 metadata={"provider": task_provider, "task_id": task_id})
                     logger.info("segment %d 完成: %s", task["seg"].get("segment_index", 0), dest)
                     break
                 elif result["status"] == "failed":
+                    _report_span(f"segment_{task['seg'].get('segment_index',0)}_failed", "custom",
+                                 error=result.get("error", "generation failed"),
+                                 duration_ms=int((time.time() - poll_start) * 1000),
+                                 metadata={"provider": task_provider, "task_id": task_id})
                     logger.warning("segment %d 失败（跳过）: %s", task["seg"].get("segment_index", 0), result.get("error", ""))
                     break
             else:
+                _report_span(f"segment_{task['seg'].get('segment_index',0)}_timeout", "custom",
+                             error="polling timeout", metadata={"provider": task_provider, "task_id": task_id})
                 logger.warning("segment %d 轮询超时（跳过）", task["seg"].get("segment_index", 0))
 
         if not video_paths:
@@ -515,7 +579,8 @@ def run_once(since: str | None = None) -> dict | None:
     if since is None:
         since = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
 
-    logger.info("=== 开始拍摄 (since=%s) ===", since)
+    _start_trace()
+    logger.info("=== 开始拍摄 (since=%s) trace=%s ===", since, _current_trace_id)
 
     # 读数据
     events = read_world_events(since)
