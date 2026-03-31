@@ -462,7 +462,7 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
                 "aspect_ratio": seg.get("aspect_ratio", "16:9"),
             }
             if ref_images:
-                body["reference_images"] = ref_images[:1]  # StarVideo 单张参考图
+                body["reference_images"] = ref_images
 
             _report_span(f"segment_{seg.get('segment_index',0)}_submit", "custom",
                          input_text=prompt, metadata={"provider": provider, "duration": body["duration"],
