@@ -147,6 +147,47 @@ INTIMATE_FILTER_INSTRUCTION = """
 """
 
 
+# ── Discord 投递 ─────────────────────────────────────────────────
+
+def _deliver_to_discord(video_path: str, caption: str = "") -> None:
+    """将成片投递到 Discord 世界频道"""
+    import httpx
+
+    gateway_url = os.environ.get("DISCORD_GATEWAY_URL", "http://127.0.0.1:4320")
+    gateway_token = os.environ.get("GATEWAY_TOKEN", os.environ.get("DISCORD_GATEWAY_TOKEN", ""))
+    world_channel_id = os.environ.get("DISCORD_WORLD_CHANNEL_ID", "")
+
+    if not world_channel_id:
+        logger.warning("DISCORD_WORLD_CHANNEL_ID not set, skipping delivery")
+        return
+
+    try:
+        headers = {"Content-Type": "application/json"}
+        if gateway_token:
+            headers["Authorization"] = f"Bearer {gateway_token}"
+
+        # 先发视频
+        resp = httpx.post(
+            f"{gateway_url}/api/messages/send-video",
+            json={"receive_id": world_channel_id, "video_path": video_path},
+            headers=headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        logger.info("视频已投递到世界频道: %s", video_path)
+
+        # 再发说明文字（如果有）
+        if caption:
+            httpx.post(
+                f"{gateway_url}/api/messages/send",
+                json={"receive_id": world_channel_id, "text": f"🎬 {caption}"},
+                headers=headers,
+                timeout=10,
+            )
+    except Exception as e:
+        logger.warning("Discord 投递失败（不影响拍摄结果）: %s", e)
+
+
 # ── 去重 ─────────────────────────────────────────────────────────
 
 def _get_dedup_context() -> str:
@@ -223,7 +264,134 @@ def step_cinematography(screenplay: dict, wardrobe_summary: dict) -> dict | None
     return result
 
 
-# ── 第四步：执行 pipeline ────────────────────────────────────────
+# ── 第三步：执行 ─────────────────────────────────────────────────
+
+MEDIA_SERVICE_URL = os.environ.get("MEDIA_SERVICE_URL", "http://127.0.0.1:4500")
+VIDEO_PROVIDER = os.environ.get("VIDEO_PROVIDER", "kling")
+
+
+def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict:
+    """通过 media-service HTTP API 生成视频（不依赖内部 kling_client，支持任意 provider）"""
+    import httpx
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    segments = segment_plan.get("segments", [])
+    if not segments:
+        return {"success": False, "error": "no segments"}
+
+    provider = VIDEO_PROVIDER
+    tmp_dir = tempfile.mkdtemp(prefix="filming_")
+
+    try:
+        # 提交所有段（并行提交，串行轮询）
+        tasks = []
+        for seg in segments:
+            # compose prompt: scene_description + shots（和 pipeline.py 的 compose_prompt 逻辑一致）
+            lines = [seg.get("scene_description", ""), ""]
+            for shot in seg.get("shots", []):
+                dur = f"{int(shot.get('duration_seconds', 5))}s"
+                lines.append(f"镜头{shot.get('shot_index', 0) + 1}，{dur}，{shot.get('scale', '')}，{shot.get('shot_prompt', '')}")
+
+            # 视角约束
+            perspective = seg.get("perspective", "first_person")
+            lines.append("")
+            if perspective == "first_person":
+                lines.append("第一人称视角，镜头是拍摄者的眼睛。角色看向镜头表示与拍摄者对话。画面中只出现上述角色，不出现其他任何人。")
+            else:
+                lines.append("电影镜头视角，角色之间自然互动，不看镜头。画面中只出现上述角色，不出现其他任何人。")
+
+            prompt = "\n".join(lines)
+
+            body = {
+                "provider": provider,
+                "prompt": prompt,
+                "duration": int(seg.get("duration_seconds", 10)),
+                "aspect_ratio": seg.get("aspect_ratio", "16:9"),
+            }
+
+            logger.info("提交 segment %d via %s (%ds)", seg.get("segment_index", 0), provider, body["duration"])
+            resp = httpx.post(f"{MEDIA_SERVICE_URL}/video/generate", json=body, timeout=30)
+            resp.raise_for_status()
+            task_info = resp.json()
+            tasks.append({"seg": seg, "taskId": task_info["taskId"], "provider": task_info["provider"], "prompt": prompt})
+
+        # 轮询所有任务
+        video_paths = []
+        prompts = []
+        for task in tasks:
+            task_id = task["taskId"]
+            task_provider = task["provider"]
+            logger.info("轮询 segment %d task=%s", task["seg"].get("segment_index", 0), task_id)
+
+            for _ in range(120):  # 最多 20 分钟
+                time.sleep(10)
+                resp = httpx.get(f"{MEDIA_SERVICE_URL}/task/{task_provider}/{task_id}", timeout=30)
+                result = resp.json()
+
+                if result["status"] == "completed":
+                    video_url = result["result"]["url"]
+                    # 下载视频
+                    dest = os.path.join(tmp_dir, f"segment_{task['seg'].get('segment_index', 0)}.mp4")
+                    dl_resp = httpx.get(video_url, timeout=120)
+                    with open(dest, "wb") as f:
+                        f.write(dl_resp.content)
+                    video_paths.append(dest)
+                    prompts.append(task["prompt"])
+                    logger.info("segment %d 完成: %s", task["seg"].get("segment_index", 0), dest)
+                    break
+                elif result["status"] == "failed":
+                    logger.error("segment %d 失败: %s", task["seg"].get("segment_index", 0), result.get("error", ""))
+                    return {"success": False, "error": result.get("error", "segment failed")}
+            else:
+                return {"success": False, "error": f"segment {task['seg'].get('segment_index', 0)} polling timeout"}
+
+        if not video_paths:
+            return {"success": False, "error": "no videos generated"}
+
+        # 拼接
+        final_path = os.path.join(tmp_dir, "final.mp4")
+        if len(video_paths) == 1:
+            shutil.copy2(video_paths[0], final_path)
+        else:
+            concat_file = os.path.join(tmp_dir, "concat.txt")
+            with open(concat_file, "w") as f:
+                for vp in video_paths:
+                    f.write(f"file '{vp}'\n")
+            subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", final_path], check=True, capture_output=True)
+
+        # 存档
+        openfang_home = os.environ.get("OPENFANG_HOME", str(Path(__file__).parent.parent / ".openfang"))
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        films_dir = Path(openfang_home) / "world" / "films" / now.strftime("%Y-%m-%d")
+        films_dir.mkdir(parents=True, exist_ok=True)
+        video_name = f"film_{now.strftime('%H%M%S')}.mp4"
+        dest_video = films_dir / video_name
+        shutil.copy2(final_path, dest_video)
+
+        meta = {
+            "video_file": video_name,
+            "duration_seconds": sum(s.get("duration_seconds", 0) for s in segments),
+            "segments": len(segments),
+            "characters": screenplay.get("characters", []),
+            "narrative_summary": screenplay.get("logline", ""),
+            "provider": provider,
+            "segment_prompts": prompts,
+            "created_at": now.isoformat(),
+        }
+        meta_path = films_dir / f"film_{now.strftime('%H%M%S')}_meta.json"
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        logger.info("archived: %s", dest_video)
+        return {"success": True, "video_path": str(dest_video), "meta_path": str(meta_path)}
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 def step_execute(segment_plan: dict, wardrobe_data: dict, screenplay: dict) -> dict:
     """执行确定性 pipeline"""
@@ -281,10 +449,18 @@ def run_once(since: str | None = None) -> dict | None:
         return None
 
     # 第三步：执行
-    logger.info("执行 pipeline...")
+    logger.info("执行 pipeline (provider=%s)...", VIDEO_PROVIDER)
     try:
-        result = step_execute(segment_plan, wardrobe_data, screenplay)
+        if VIDEO_PROVIDER == "kling":
+            result = step_execute(segment_plan, wardrobe_data, screenplay)
+        else:
+            result = step_execute_via_media_service(segment_plan, screenplay)
         logger.info("=== 拍摄完成 === %s", json.dumps(result, ensure_ascii=False)[:300])
+
+        # 第四步：投递到 Discord 世界频道
+        if result.get("success") and result.get("video_path"):
+            _deliver_to_discord(result["video_path"], screenplay.get("logline", ""))
+
         return result
     except Exception:
         logger.exception("pipeline 执行失败")
