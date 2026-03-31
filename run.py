@@ -468,10 +468,14 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
                          input_text=prompt, metadata={"provider": provider, "duration": body["duration"],
                                                        "ref_images": len(ref_images)})
             logger.info("提交 segment %d via %s (%ds)\nprompt:\n%s", seg.get("segment_index", 0), provider, body["duration"], prompt)
-            resp = httpx.post(f"{MEDIA_SERVICE_URL}/video/generate", json=body, timeout=30)
-            resp.raise_for_status()
-            task_info = resp.json()
-            tasks.append({"seg": seg, "taskId": task_info["taskId"], "provider": task_info["provider"], "prompt": prompt})
+            try:
+                resp = httpx.post(f"{MEDIA_SERVICE_URL}/video/generate", json=body, timeout=30)
+                resp.raise_for_status()
+                task_info = resp.json()
+                tasks.append({"seg": seg, "taskId": task_info["taskId"], "provider": task_info["provider"], "prompt": prompt})
+            except Exception as e:
+                _report_span(f"segment_{seg.get('segment_index',0)}_submit_error", "custom", error=str(e))
+                logger.warning("segment %d 提交失败（跳过）: %s", seg.get("segment_index", 0), e)
 
         # 轮询所有任务
         video_paths = []
