@@ -147,6 +147,75 @@ INTIMATE_FILTER_INSTRUCTION = """
 """
 
 
+# ── OSS 上传 ─────────────────────────────────────────────────────
+
+OSS_UPLOAD_BASE_URL = os.environ.get("OSS_UPLOAD_BASE_URL", "http://127.0.0.1:4390")
+OSS_UPLOAD_TOKEN = os.environ.get("OSS_UPLOAD_TOKEN", "")
+_oss_uploaded_files: list[str] = []  # 跟踪上传的文件，pipeline 结束后清理
+
+
+def upload_to_oss(file_path: str, kind: str = "images") -> str:
+    """上传本地文件到 OSS，返回 public URL"""
+    import httpx
+
+    with open(file_path, "rb") as f:
+        file_data = f.read()
+
+    # 用时间戳+随机后缀避免文件名冲突
+    import hashlib
+    ext = os.path.splitext(file_path)[1] or ".bin"
+    filename = f"{hashlib.md5(file_path.encode()).hexdigest()[:12]}{ext}"
+    files = {"file": (filename, file_data, "application/octet-stream")}
+    data = {"kind": kind, "filename": filename}
+    headers = {}
+    if OSS_UPLOAD_TOKEN:
+        headers["Authorization"] = f"Bearer {OSS_UPLOAD_TOKEN}"
+
+    resp = httpx.post(
+        f"{OSS_UPLOAD_BASE_URL}/api/v1/uploads/files",
+        files=files,
+        data=data,
+        headers=headers,
+        timeout=60,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    if not result.get("ok"):
+        raise RuntimeError(f"OSS upload failed: {result.get('error', '')}")
+
+    url = result["data"].get("url", "")
+    stored_path = result["data"].get("stored_path", "")
+    # 替换本地地址为公网地址
+    public_base = os.environ.get("OSS_PUBLIC_BASE_URL", "http://www.lujiji.com")
+    url = url.replace(OSS_UPLOAD_BASE_URL, public_base)
+    # 记录用于后续清理
+    if stored_path:
+        _oss_uploaded_files.append(stored_path)
+    logger.info("OSS 上传完成: %s → %s", file_path, url)
+    return url
+
+
+def cleanup_oss_uploads() -> None:
+    """清理本次拍摄上传的临时文件"""
+    import httpx
+    if not _oss_uploaded_files:
+        return
+    headers = {}
+    if OSS_UPLOAD_TOKEN:
+        headers["Authorization"] = f"Bearer {OSS_UPLOAD_TOKEN}"
+    for stored_path in _oss_uploaded_files:
+        try:
+            httpx.delete(
+                f"{OSS_UPLOAD_BASE_URL}/api/v1/uploads{stored_path}",
+                headers=headers,
+                timeout=10,
+            )
+        except Exception:
+            pass  # best effort
+    logger.info("OSS 清理: %d 个临时文件", len(_oss_uploaded_files))
+    _oss_uploaded_files.clear()
+
+
 # ── Discord 投递 ─────────────────────────────────────────────────
 
 def _deliver_to_discord(video_path: str, caption: str = "") -> None:
@@ -320,12 +389,29 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
 
             prompt = "\n".join(lines)
 
+            # 收集角色参考图（定妆照）→ 上传 OSS 拿 URL
+            ref_images = []
+            for char in seg.get("characters", []):
+                char_id = char.get("character_id", "")
+                item_id = char.get("outfit_item_id", "")
+                if char_id and item_id:
+                    base_img = os.path.join(OPENFANG_HOME, "agents", char_id, "wardrobe", item_id, "base.png")
+                    if os.path.exists(base_img):
+                        try:
+                            url = upload_to_oss(base_img, kind="images")
+                            ref_images.append(url)
+                            logger.info("  角色参考图: %s/%s → %s", char_id, item_id, url)
+                        except Exception as e:
+                            logger.warning("  角色参考图上传失败: %s", e)
+
             body = {
                 "provider": provider,
                 "prompt": prompt,
                 "duration": int(seg.get("duration_seconds", 10)),
                 "aspect_ratio": seg.get("aspect_ratio", "16:9"),
             }
+            if ref_images:
+                body["reference_images"] = ref_images[:1]  # StarVideo 单张参考图
 
             logger.info("提交 segment %d via %s (%ds)", seg.get("segment_index", 0), provider, body["duration"])
             resp = httpx.post(f"{MEDIA_SERVICE_URL}/video/generate", json=body, timeout=30)
@@ -480,6 +566,8 @@ def run_once(since: str | None = None) -> dict | None:
     except Exception:
         logger.exception("pipeline 执行失败")
         return None
+    finally:
+        cleanup_oss_uploads()
 
 
 def run_schedule(interval_hours: float = 3.0) -> None:
