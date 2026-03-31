@@ -162,19 +162,34 @@ def _deliver_to_discord(video_path: str, caption: str = "") -> None:
         return
 
     try:
+        import subprocess as _sp
+        import tempfile as _tf
+
         headers = {"Content-Type": "application/json"}
         if gateway_token:
             headers["Authorization"] = f"Bearer {gateway_token}"
 
-        # 先发视频
+        # Discord 非 Nitro 限制 8MB，压缩后投递
+        send_path = video_path
+        file_size = os.path.getsize(video_path)
+        if file_size > 7 * 1024 * 1024:  # > 7MB 就压缩
+            compressed = _tf.mktemp(suffix=".mp4", prefix="film_discord_")
+            _sp.run([
+                "ffmpeg", "-y", "-i", video_path,
+                "-c:v", "libx264", "-crf", "28", "-preset", "fast",
+                "-c:a", "aac", "-b:a", "64k", compressed,
+            ], check=True, capture_output=True)
+            send_path = compressed
+            logger.info("视频压缩: %dMB → %dMB", file_size // (1024*1024), os.path.getsize(compressed) // (1024*1024))
+
         resp = httpx.post(
             f"{gateway_url}/api/messages/send-video",
-            json={"receive_id": world_channel_id, "video_path": video_path},
+            json={"receive_id": world_channel_id, "video_path": send_path},
             headers=headers,
-            timeout=30,
+            timeout=60,
         )
         resp.raise_for_status()
-        logger.info("视频已投递到世界频道: %s", video_path)
+        logger.info("视频已投递到世界频道: %s", send_path)
 
         # 再发说明文字（如果有）
         if caption:
