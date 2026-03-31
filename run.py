@@ -519,11 +519,34 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
                     logger.info("segment %d 完成: %s", task["seg"].get("segment_index", 0), dest)
                     break
                 elif result["status"] == "failed":
+                    err_msg = result.get("error", "generation failed")
+                    # fallback 到 kling
+                    if task_provider != "kling":
+                        _report_span(f"segment_{task['seg'].get('segment_index',0)}_fallback", "custom",
+                                     input_text=f"原 provider {task_provider} 失败: {err_msg}",
+                                     output_text="fallback 到 kling",
+                                     metadata={"original_provider": task_provider, "original_task_id": task_id, "error": err_msg})
+                        logger.warning("segment %d %s 失败，fallback 到 kling: %s", task["seg"].get("segment_index", 0), task_provider, err_msg)
+                        try:
+                            fb_body = {**body, "provider": "kling"}
+                            fb_resp = httpx.post(f"{MEDIA_SERVICE_URL}/video/generate", json=fb_body, timeout=30)
+                            fb_resp.raise_for_status()
+                            fb_info = fb_resp.json()
+                            task_id = fb_info["taskId"]
+                            task_provider = fb_info["provider"]
+                            task["taskId"] = task_id
+                            task["provider"] = task_provider
+                            poll_start = time.time()
+                            logger.info("  kling fallback 已提交: task=%s", task_id)
+                            continue  # 继续轮询 kling 的任务
+                        except Exception as fb_e:
+                            logger.warning("  kling fallback 也失败: %s", fb_e)
+
                     _report_span(f"segment_{task['seg'].get('segment_index',0)}_failed", "custom",
-                                 error=result.get("error", "generation failed"),
+                                 error=err_msg,
                                  duration_ms=int((time.time() - poll_start) * 1000),
                                  metadata={"provider": task_provider, "task_id": task_id})
-                    logger.warning("segment %d 失败（跳过）: %s", task["seg"].get("segment_index", 0), result.get("error", ""))
+                    logger.warning("segment %d 失败（跳过）: %s", task["seg"].get("segment_index", 0), err_msg)
                     break
             else:
                 _report_span(f"segment_{task['seg'].get('segment_index',0)}_timeout", "custom",
