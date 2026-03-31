@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""生活拍摄系统入口 — 基于 DeerFlow 的角色生活拍摄
+"""生活拍摄系统入口 — 脚本编排 + LLM 调用 + 确定性 pipeline
 
 使用方式：
-  # 单次拍摄（手动触发）
-  python run.py once
-
-  # 定时调度（每 N 小时自动触发）
-  python run.py schedule --interval 3
-
-  # 只运行选题（调试用）
-  python run.py curate
+  python run.py once                    # 单次拍摄
+  python run.py schedule --interval 3   # 定时调度
+  python run.py curate                  # 只运行选题（调试）
 """
 
 from __future__ import annotations
@@ -18,193 +13,326 @@ import argparse
 import json
 import logging
 import os
+import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# 确保 backend 包和自定义模块可导入
-sys.path.insert(0, str(Path(__file__).parent / "backend"))
+# 确保自定义模块可导入
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 os.chdir(Path(__file__).parent)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
 logger = logging.getLogger("filming")
 
-# DeerFlow 配置路径
-os.environ.setdefault("DEER_FLOW_CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
-os.environ.setdefault(
-    "DEER_FLOW_EXTENSIONS_CONFIG_PATH",
-    str(Path(__file__).parent / "extensions_config.json"),
-)
-
-# 加载 .env（如果存在）
 env_path = Path(__file__).parent / ".env"
 if env_path.exists():
     from dotenv import load_dotenv
     load_dotenv(env_path)
 
-def _ensure_subagents_registered():
-    """注册拍摄系统的 sub-agent 到 DeerFlow registry（延迟执行，避免循环导入）"""
-    from deerflow.subagents.registry import register_subagents, get_subagent_names
-    if "scene-curator" not in get_subagent_names():
-        from filming_custom.subagents import FILMING_SUBAGENTS
-        register_subagents(FILMING_SUBAGENTS)
+OPENFANG_HOME = os.environ.get("OPENFANG_HOME", str(Path(__file__).parent.parent / ".openfang"))
+SKILLS_DIR = Path(__file__).parent / "skills" / "custom"
+
+# ── Skill 加载 ──────────────────────────────────────────────────────
+
+def _load_skill(name: str) -> str:
+    """读取 skill 文件内容（去掉 frontmatter）"""
+    path = SKILLS_DIR / name / "SKILL.md"
+    if not path.exists():
+        logger.warning("skill not found: %s", path)
+        return ""
+    text = path.read_text("utf-8")
+    # 去掉 YAML frontmatter
+    if text.startswith("---"):
+        end = text.find("---", 3)
+        if end > 0:
+            text = text[end + 3:].strip()
+    return text
 
 
-FILMING_PROMPT_TEMPLATE = """你是生活拍摄系统的导演（Lead Agent）。你的职责是协调选题编辑和摄影师，完成角色日常生活的视频拍摄。
+# ── 数据读取（通过 Node.js 调 OpenFang MCP 模块）─────────────────
 
-## 绝对规则
-画面中只拍 AI 角色（宋玉、紫灵等），绝对不出现用户（公子），提都不要提。
-角色与公子的对话，通过角色的独白、自言自语、对着镜头说话来呈现。
+def _node_eval(script: str) -> str:
+    """执行 Node.js 脚本，返回 stdout"""
+    result = subprocess.run(
+        ["node", "-e", script],
+        capture_output=True, text=True,
+        cwd=str(Path(OPENFANG_HOME).parent),
+        env={**os.environ, "OPENFANG_HOME": OPENFANG_HOME},
+    )
+    if result.returncode != 0:
+        logger.error("node eval failed: %s", result.stderr[:300])
+        return ""
+    return result.stdout.strip()
 
-## 拍摄视角
-有两种拍摄视角，根据指令选择：
 
-- **"某个人的一天"**：聚焦单个角色，告诉 scene-curator 用 query_diary_raw_events 查询该角色的日记原始事件
-- **"世界里的一天"**：全角色视角，告诉 scene-curator 用 query_world_events 查询世界事件
+def read_world_events(since: str, limit: int = 200) -> list[dict]:
+    """读取世界事件"""
+    raw = _node_eval(f'''
+const {{ readWorldEvents }} = require("./mcp/toolbox-mcp/tools/world_events");
+const events = readWorldEvents({{ since: "{since}", limit: {limit} }});
+console.log(JSON.stringify(events));
+''')
+    return json.loads(raw) if raw else []
 
-默认使用"世界里的一天"视角。
 
-{dedup_section}
+def read_wardrobe(agent_name: str) -> dict:
+    """读取角色衣橱 manifest"""
+    raw = _node_eval(f'''
+const path = require("path"), fs = require("fs");
+const mf = path.join(process.env.OPENFANG_HOME, "agents", "{agent_name}", "wardrobe", "manifest.json");
+if (fs.existsSync(mf)) console.log(fs.readFileSync(mf, "utf-8"));
+else console.log("{{}}");
+''')
+    return json.loads(raw) if raw else {}
 
-## 流程
 
-### 第一步：选题
-委派 scene-curator sub-agent，告诉它用哪个数据源和视角。
+# ── LLM 调用 ────────────────────────────────────────────────────────
 
-{dedup_instruction}
+def _call_llm(system: str, user: str) -> str:
+    """调用 LLM（使用 .env 中的 OPENAI 配置）"""
+    import httpx
 
-如果 scene-curator 返回 skip（没有值得拍摄的内容），直接报告"本次无拍摄内容"并结束。
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://zaoci-02-gpt-east-us2.openai.azure.com/openai/v1")
+    model = os.environ.get("FILMING_MODEL", "gpt-5.4")
 
-### 第二步：摄影设计
-将 scene-curator 输出的 FilmBrief 交给 cinematographer sub-agent，让它设计 SegmentPlan。
+    resp = httpx.post(
+        f"{base_url}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "temperature": 0.7,
+            "max_completion_tokens": 8192,
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
 
-收到 SegmentPlan 后检查硬约束：
-- 总段数 ≤ 8
-- 总时长 ≤ 60 秒
-如果超出约束，要求 cinematographer 精简。
 
-### 第三步：执行视频生成
-收集 SegmentPlan 中所有角色的衣橱数据（通过 MCP read_wardrobe 工具读取各角色衣橱），然后调用 execute_filming_pipeline 工具执行确定性管线。
+def _extract_json(text: str) -> dict | None:
+    """从 LLM 输出中提取 JSON"""
+    # 先试 markdown 代码块
+    m = re.search(r"```(?:json)?\s*\n([\s\S]+?)\n```", text)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    # 再试裸 JSON
+    m = re.search(r"\{[\s\S]+\}", text)
+    if m:
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
+    return None
 
-传入参数：
-- segment_plan_json: cinematographer 输出的 SegmentPlan JSON
-- wardrobe_data_json: 衣橱数据 JSON
-- film_brief_summary: FilmBrief 的叙事概要
-- time_range_start: FilmBrief 中的事件时间范围起点
-- time_range_end: FilmBrief 中的事件时间范围终点
 
-## 注意
-- 每个 sub-agent 有独立上下文，你需要把上一个 sub-agent 的完整输出传递给下一个
-- 如果某个环节失败，报告错误原因并停止，不要重试
-- 拍摄完成后汇总报告：成片路径、时长、涉及角色、段数
+# ── 亲密场景过滤 ─────────────────────────────────────────────────
+
+INTIMATE_FILTER = os.environ.get("FILMING_FILTER_INTIMATE", "true").lower() in ("true", "1", "yes")
+
+INTIMATE_FILTER_INSTRUCTION = """
+亲密场景过滤已开启。直接跳过以下事件：
+- 亲吻、拥抱、肢体亲密接触
+- 卧室内的亲密互动
+- 任何带有情色暗示的对话或动作描写
+- 洗澡、换衣服等涉及裸露的场景
+如果所有事件都是亲密场景，输出 {"skip": true, "reason": "当前时段内容不适合拍摄"}
 """
 
 
-def _build_filming_prompt() -> str:
-    """构建包含去重信息的拍摄 prompt"""
-    from filming_custom.filming_log import (
-        format_filmed_ranges_for_prompt,
-        get_recent_filmings,
-    )
+# ── 去重 ─────────────────────────────────────────────────────────
 
+def _get_dedup_context() -> str:
+    from filming_custom.filming_log import get_recent_filmings, format_filmed_ranges_for_prompt
     recent = get_recent_filmings(hours=48)
-    dedup_text = format_filmed_ranges_for_prompt(recent)
+    return format_filmed_ranges_for_prompt(recent) or ""
 
-    if dedup_text:
-        dedup_section = dedup_text
-        dedup_instruction = "把上述已拍摄的时间范围信息传递给 scene-curator，让它在选题时跳过这些时段。"
+
+# ── 第一步：编剧 ─────────────────────────────────────────────────
+
+def step_screenplay(events: list[dict]) -> dict | None:
+    """调 LLM 选题+编剧，直接输出完整剧本"""
+    skill = _load_skill("screenplay")
+    dedup = _get_dedup_context()
+
+    system = f"你是拍摄系统的编剧。从角色的生活事件中选择值得拍的内容，写成完整的视频剧本。\n\n{skill}"
+    if INTIMATE_FILTER:
+        system += f"\n{INTIMATE_FILTER_INSTRUCTION}"
+
+    # 均匀采样，覆盖全天
+    if len(events) > 80:
+        step = len(events) / 80
+        sampled = [events[int(i * step)] for i in range(80)]
     else:
-        dedup_section = ""
-        dedup_instruction = ""
+        sampled = events
 
-    return FILMING_PROMPT_TEMPLATE.format(
-        dedup_section=dedup_section,
-        dedup_instruction=dedup_instruction,
+    events_text = json.dumps(sampled, ensure_ascii=False)
+    user = f"以下是今天的世界事件（{len(events)} 条中采样 {len(sampled)} 条，覆盖全天）：\n{events_text}"
+    if dedup:
+        user += f"\n\n已拍摄过的时间段（请跳过）：\n{dedup}"
+
+    logger.info("编剧: %d events, calling LLM...", len(sampled))
+    result_text = _call_llm(system, user)
+    result = _extract_json(result_text)
+
+    if not result:
+        logger.error("编剧返回无法解析: %s", result_text[:300])
+        return None
+
+    if result.get("skip"):
+        logger.info("编剧: skip — %s", result.get("reason", ""))
+        return None
+
+    logger.info("编剧完成: %s | %d segments", result.get("logline", "")[:80], len(result.get("segments", [])))
+    return result
+
+
+# ── 第二步：摄影设计 ──────────────────────────────────────────────
+
+def step_cinematography(screenplay: dict, wardrobe_summary: dict) -> dict | None:
+    """调 LLM 按剧本设计分镜，输出 SegmentPlan"""
+    cinematography_skill = _load_skill("cinematography")
+    kling_skill = _load_skill("kling-constraints")
+
+    system = f"你是拍摄系统的摄影师。根据编剧写好的剧本，设计每段的具体分镜。\n\n{cinematography_skill}\n\n{kling_skill}"
+
+    user = f"""编剧剧本：
+{json.dumps(screenplay, ensure_ascii=False, indent=2)}
+
+各角色衣橱（用于匹配 outfit_item_id）:
+{json.dumps(wardrobe_summary, ensure_ascii=False, indent=2)}
+
+按剧本设计每段分镜，输出 SegmentPlan JSON。"""
+
+    logger.info("摄影设计: calling LLM...")
+    result_text = _call_llm(system, user)
+    result = _extract_json(result_text)
+
+    if not result or "segments" not in result:
+        logger.error("摄影设计返回无效: %s", result_text[:500])
+        return None
+
+    logger.info("摄影设计完成: %d segments", len(result["segments"]))
+    return result
+
+
+# ── 第四步：执行 pipeline ────────────────────────────────────────
+
+def step_execute(segment_plan: dict, wardrobe_data: dict, screenplay: dict) -> dict:
+    """执行确定性 pipeline"""
+    from filming_custom.tools import parse_segment_plan, run_pipeline
+
+    plan_json = json.dumps(segment_plan, ensure_ascii=False)
+
+    return run_pipeline(
+        segment_plan_json=plan_json,
+        wardrobe_data=wardrobe_data,
+        film_brief_summary=screenplay.get("logline", ""),
+        time_range_start=screenplay.get("time_range", {}).get("start", ""),
+        time_range_end=screenplay.get("time_range", {}).get("end", ""),
     )
 
 
-def run_once(thread_id: str | None = None) -> str | None:
+# ── 完整流程 ─────────────────────────────────────────────────────
+
+def run_once(since: str | None = None) -> dict | None:
     """执行一次完整的拍摄流程"""
-    from deerflow.client import DeerFlowClient
-    _ensure_subagents_registered()
+    if since is None:
+        since = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
 
-    client = DeerFlowClient(
-        config_path=str(Path(__file__).parent / "config.yaml"),
-    )
+    logger.info("=== 开始拍摄 (since=%s) ===", since)
 
-    if thread_id is None:
-        thread_id = f"filming-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    # 读数据
+    events = read_world_events(since)
+    logger.info("读取到 %d 个世界事件", len(events))
+    if not events:
+        logger.info("无事件，结束")
+        return None
 
-    logger.info("开始拍摄流程: thread_id=%s", thread_id)
+    # 第一步：编剧（选题+剧本）
+    screenplay = step_screenplay(events)
+    if not screenplay:
+        return None
 
+    # 读衣橱
+    characters = screenplay.get("characters", [])
+    wardrobe_data = {}
+    wardrobe_summary = {}
+    for char_id in characters:
+        wd = read_wardrobe(char_id)
+        wardrobe_data[char_id] = wd
+        items = wd.get("items", {})
+        wardrobe_summary[char_id] = [
+            {"id": iid, "name": item.get("name", "")[:40]}
+            for iid, item in items.items()
+            if item.get("element_id")
+        ]
+
+    # 第二步：摄影设计
+    segment_plan = step_cinematography(screenplay, wardrobe_summary)
+    if not segment_plan:
+        return None
+
+    # 第三步：执行
+    logger.info("执行 pipeline...")
     try:
-        prompt = _build_filming_prompt()
-        result = client.chat(
-            message=prompt,
-            thread_id=thread_id,
-        )
-        logger.info("拍摄流程完成: %s", result[:200] if result else "(empty)")
+        result = step_execute(segment_plan, wardrobe_data, screenplay)
+        logger.info("=== 拍摄完成 === %s", json.dumps(result, ensure_ascii=False)[:300])
         return result
     except Exception:
-        logger.exception("拍摄流程失败")
+        logger.exception("pipeline 执行失败")
         return None
 
 
 def run_schedule(interval_hours: float = 3.0) -> None:
-    """定时调度：每 N 小时触发一次拍摄"""
+    """定时调度"""
     logger.info("启动定时调度: 每 %.1f 小时", interval_hours)
-    interval_seconds = interval_hours * 3600
-
     while True:
         try:
             run_once()
         except Exception:
-            logger.exception("本轮拍摄异常，等待下一轮")
+            logger.exception("本轮拍摄异常")
+        logger.info("等待 %.1f 小时...", interval_hours)
+        time.sleep(interval_hours * 3600)
 
-        logger.info("等待 %.1f 小时后执行下一轮...", interval_hours)
-        time.sleep(interval_seconds)
 
-
-def run_curate() -> None:
-    """只运行选题（调试用）"""
-    from deerflow.client import DeerFlowClient
-    _ensure_subagents_registered()
-
-    client = DeerFlowClient(
-        config_path=str(Path(__file__).parent / "config.yaml"),
-    )
-
-    thread_id = f"curate-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
-
-    result = client.chat(
-        message="请委派 scene-curator sub-agent 查看最近 4 小时的世界事件，筛选值得拍摄的内容。返回 FilmBrief 或 skip 决定。",
-        thread_id=thread_id,
-    )
-    print(result)
+def run_curate(since: str | None = None) -> None:
+    """只运行选题（调试）"""
+    if since is None:
+        since = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
+    events = read_world_events(since)
+    result = step_curate(events)
+    print(json.dumps(result, ensure_ascii=False, indent=2) if result else "skip")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="生活拍摄系统")
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("once", help="单次拍摄")
-    sched = sub.add_parser("schedule", help="定时调度")
-    sched.add_argument("--interval", type=float, default=3.0, help="调度间隔（小时）")
-    sub.add_parser("curate", help="只运行选题（调试）")
+    once_p = sub.add_parser("once", help="单次拍摄")
+    once_p.add_argument("--since", help="事件起始时间 (ISO8601)")
+
+    sched_p = sub.add_parser("schedule", help="定时调度")
+    sched_p.add_argument("--interval", type=float, default=3.0, help="间隔（小时）")
+
+    curate_p = sub.add_parser("curate", help="只运行选题")
+    curate_p.add_argument("--since", help="事件起始时间 (ISO8601)")
 
     args = parser.parse_args()
 
     if args.command == "once":
-        run_once()
+        run_once(args.since)
     elif args.command == "schedule":
         run_schedule(args.interval)
     elif args.command == "curate":
-        run_curate()
+        run_curate(args.since)
     else:
         parser.print_help()
 

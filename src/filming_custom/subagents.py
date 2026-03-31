@@ -1,6 +1,23 @@
 """拍摄系统 sub-agent 配置 — 外部定义，通过 registry 扩展点注册到 DeerFlow"""
 
+import os
+
 from deerflow.subagents.config import SubagentConfig
+
+# 亲密场景过滤开关：为 true 时 Scene Curator 直接跳过所有亲密/情色场景
+FILTER_INTIMATE = os.environ.get("FILMING_FILTER_INTIMATE", "true").lower() in ("true", "1", "yes")
+
+_INTIMATE_FILTER_RULE = """
+<intimate_scene_filter>
+亲密场景过滤已开启。直接跳过以下类型的事件，不要选入 FilmBrief：
+- 亲吻、拥抱、肢体亲密接触
+- 卧室内的亲密互动
+- 任何带有情色暗示的对话或动作描写
+- 洗澡、换衣服等涉及裸露的场景
+
+如果整个时间窗口的事件都是亲密场景，输出 {"skip": true, "reason": "当前时段内容不适合拍摄"}
+</intimate_scene_filter>
+"""
 
 SCENE_CURATOR_CONFIG = SubagentConfig(
     name="scene-curator",
@@ -90,11 +107,11 @@ Lead agent 会告诉你用哪个视角。如果没有指定，默认用世界事
 - 不要编造事件，只使用从 MCP 查询到的真实数据
 - 不要指定视频时长，时长由 Cinematographer 决定
 </important>
-""",
+""" + (_INTIMATE_FILTER_RULE if FILTER_INTIMATE else ""),
     tools=None,
-    disallowed_tools=["task", "ask_clarification", "present_files", "execute_filming_pipeline"],
+    disallowed_tools=["task", "ask_clarification", "present_files"],
     model="inherit",
-    max_turns=20,
+    max_turns=50,
 )
 
 CINEMATOGRAPHER_CONFIG = SubagentConfig(
@@ -242,9 +259,9 @@ prompt 编写要点：
 </important>
 """,
     tools=None,
-    disallowed_tools=["task", "ask_clarification", "present_files", "execute_filming_pipeline"],
+    disallowed_tools=["task", "ask_clarification", "present_files"],
     model="inherit",
-    max_turns=20,
+    max_turns=50,
 )
 
 # 外部 sub-agent 注册表，供 DeerFlow registry 扩展点使用

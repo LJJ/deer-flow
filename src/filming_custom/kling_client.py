@@ -115,14 +115,19 @@ async def submit_video(
         body["element_list"] = element_list
 
     if first_frame_url:
+        # 本地文件路径转纯 base64 字符串（KlingAI 接受纯 base64，不要 data URL 前缀）
+        if first_frame_url.startswith("/") or first_frame_url.startswith("./"):
+            import base64
+            with open(first_frame_url, "rb") as f:
+                first_frame_url = base64.b64encode(f.read()).decode()
         body["image_list"] = [{"image_url": first_frame_url, "type": "first_frame"}]
 
     logger.info(
-        "kling_submit: elements=%d prompt_len=%d duration=%ds first_frame=%s",
+        "kling_submit: elements=%d duration=%ds first_frame=%s\nprompt:\n%s",
         len(element_list),
-        len(prompt),
         duration_seconds,
         bool(first_frame_url),
+        prompt,
     )
 
     data = await client.post("/v1/videos/omni-video", body)
@@ -135,7 +140,7 @@ async def poll_video(
     client: KlingClient,
     task_id: str,
     interval: float = 10.0,
-    timeout: float = 300.0,
+    timeout: float = 600.0,
 ) -> dict[str, Any]:
     """轮询视频生成任务直到完成或超时，返回完整的 task data"""
     start = time.monotonic()
@@ -160,9 +165,18 @@ async def poll_video(
 
 async def download_video(url: str, dest_path: str) -> None:
     """下载视频文件到本地路径"""
-    async with httpx.AsyncClient(timeout=60.0) as http:
-        resp = await http.get(url)
-        resp.raise_for_status()
-        with open(dest_path, "wb") as f:
-            f.write(resp.content)
-    logger.info("kling_downloaded: %s -> %s", url, dest_path)
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as http:
+                resp = await http.get(url)
+                resp.raise_for_status()
+                with open(dest_path, "wb") as f:
+                    f.write(resp.content)
+            logger.info("kling_downloaded: %s -> %s", url, dest_path)
+            return
+        except (httpx.ReadTimeout, httpx.ConnectError) as e:
+            if attempt < 2:
+                logger.warning("download retry %d/3: %s", attempt + 1, e)
+                await asyncio.sleep(5)
+            else:
+                raise

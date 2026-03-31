@@ -49,7 +49,7 @@ def resolve_elements(
                 char.outfit_item_id,
             )
             continue
-        element_list.append({"id": element_id, "name": char.character_id})
+        element_list.append({"element_id": str(element_id), "name": char.character_id})
     return element_list
 
 
@@ -101,6 +101,13 @@ def compose_prompt(segment: Segment, element_list: list[dict[str, str]]) -> str:
         # fallback：如果没有 shots，用 segment.prompt 整段描述
         lines.append(_replace_names(segment.prompt, element_list))
 
+    # 根据视角追加约束
+    lines.append("")
+    if segment.perspective == "first_person":
+        lines.append("第一人称视角，镜头是拍摄者的眼睛。角色看向镜头表示与拍摄者对话。画面中只出现上述角色，不出现其他任何人。")
+    else:
+        lines.append("电影镜头视角，角色之间自然互动，不看镜头。画面中只出现上述角色，不出现其他任何人。")
+
     return "\n".join(lines)
 
 
@@ -114,8 +121,8 @@ async def generate_single_segment(
     element_list: list[dict[str, str]],
     first_frame_url: str | None = None,
     output_dir: str = "/tmp/filming",
-) -> str:
-    """生成单段视频，返回本地视频文件路径"""
+) -> tuple[str, str]:
+    """生成单段视频，返回 (本地视频文件路径, 发给 KlingAI 的 prompt)"""
     prompt = compose_prompt(segment, element_list)
 
     task_id = await submit_video(
@@ -141,7 +148,7 @@ async def generate_single_segment(
     os.makedirs(output_dir, exist_ok=True)
     dest = os.path.join(output_dir, f"segment_{segment.segment_index}.mp4")
     await download_video(video_url, dest)
-    return dest
+    return dest, prompt
 
 
 def extract_last_frame(video_path: str, output_path: str) -> str:
@@ -164,36 +171,37 @@ async def generate_all_segments(
     plan: SegmentPlan,
     wardrobe_data: dict[str, Any],
     output_dir: str | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """按 SegmentPlan 生成所有段的视频。
 
     根据 transition_to_next 决定串行（first_frame 传递）或并行。
-    返回按段顺序排列的本地视频文件路径列表。
+    返回 (视频路径列表, prompt 列表)。
     """
     if output_dir is None:
         output_dir = tempfile.mkdtemp(prefix="filming_")
 
     segments = plan.segments
     video_paths: list[str | None] = [None] * len(segments)
+    prompts: list[str] = [""] * len(segments)
 
-    # 构建依赖图：如果前一段的 transition_to_next == "first_frame"，
-    # 则后一段依赖前一段（串行）；否则可并行
+    # 构建 chain 列表：连续 first_frame 的段组成一条 chain，不同 chain 可并行
+    chains: list[list[int]] = []
     i = 0
     while i < len(segments):
-        # 找出从 i 开始的连续 first_frame 串行链
         chain = [i]
         j = i
         while j < len(segments) - 1 and segments[j].transition_to_next == "first_frame":
             chain.append(j + 1)
             j += 1
+        chains.append(chain)
+        i = j + 1
 
-        # 如果只有一个段或者是 hard_cut/scene_reference 开头，可以并行启动
-        # 但 first_frame 链内部必须串行
+    async def _run_chain(chain: list[int]) -> None:
         first_frame_url = None
         for seg_idx in chain:
             seg = segments[seg_idx]
             element_list = resolve_elements(seg, wardrobe_data)
-            path = await generate_single_segment(
+            path, prompt = await generate_single_segment(
                 client=client,
                 segment=seg,
                 element_list=element_list,
@@ -201,8 +209,8 @@ async def generate_all_segments(
                 output_dir=output_dir,
             )
             video_paths[seg_idx] = path
+            prompts[seg_idx] = prompt
 
-            # 如果下一段需要 first_frame，提取末帧
             if seg.transition_to_next == "first_frame" and seg_idx < len(segments) - 1:
                 frame_path = os.path.join(output_dir, f"frame_{seg_idx}.jpg")
                 extract_last_frame(path, frame_path)
@@ -210,9 +218,11 @@ async def generate_all_segments(
             else:
                 first_frame_url = None
 
-        i = j + 1
+    # 并行执行所有独立 chain
+    await asyncio.gather(*[_run_chain(c) for c in chains])
 
-    return [p for p in video_paths if p is not None]
+    valid = [(p, pr) for p, pr in zip(video_paths, prompts) if p is not None]
+    return [v[0] for v in valid], [v[1] for v in valid]
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +265,7 @@ def archive_film(
     film_brief_summary: str,
     time_range_start: str = "",
     time_range_end: str = "",
+    segment_prompts: list[str] | None = None,
     openfang_home: str | None = None,
 ) -> dict[str, str]:
     """将成片存入 .openfang/world/films/YYYY-MM-DD/，附带 meta.json，并写入拍摄记录。
@@ -296,6 +307,7 @@ def archive_film(
         "time_range_start": time_range_start,
         "time_range_end": time_range_end,
         "created_at": now.isoformat(),
+        "segment_prompts": segment_prompts or [],
     }
 
     meta_path = films_dir / f"film_{time_str}_meta.json"
@@ -335,7 +347,7 @@ async def execute_pipeline(
 
     try:
         # 生成所有段
-        video_paths = await generate_all_segments(client, plan, wardrobe_data, tmp_dir)
+        video_paths, segment_prompts = await generate_all_segments(client, plan, wardrobe_data, tmp_dir)
 
         if not video_paths:
             raise RuntimeError("没有生成任何视频段")
@@ -349,6 +361,7 @@ async def execute_pipeline(
             final_path, plan, film_brief_summary,
             time_range_start=time_range_start,
             time_range_end=time_range_end,
+            segment_prompts=segment_prompts,
         )
         return result
 

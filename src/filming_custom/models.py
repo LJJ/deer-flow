@@ -73,7 +73,8 @@ class Segment:
     transition_to_next: str  # "first_frame" / "scene_reference" / "hard_cut"
     characters: list[CharacterInSegment]
     shots: list[Shot]
-    prompt: str  # Cinematographer 直接输出的整段连贯叙事，供 KlingAI 使用
+    perspective: str = "first_person"  # "first_person"（公子在场）或 "third_person"（公子不在场）
+    prompt: str = ""  # Cinematographer 直接输出的整段连贯叙事，供 KlingAI 使用
 
 
 @dataclass
@@ -90,7 +91,7 @@ class SegmentPlan:
     def total_segments(self) -> int:
         return len(self.segments)
 
-    def validate_constraints(self, max_segments: int = 8, max_duration: float = 60.0) -> list[str]:
+    def validate_constraints(self, max_segments: int = 6, max_duration: float = 60.0) -> list[str]:
         """检查硬约束，返回违规列表"""
         errors = []
         if self.total_segments > max_segments:
@@ -98,10 +99,17 @@ class SegmentPlan:
         if self.total_duration > max_duration:
             errors.append(f"总时长 {self.total_duration:.1f}s 超过上限 {max_duration}s")
         for seg in self.segments:
-            if seg.duration_seconds < 5 or seg.duration_seconds > 10:
+            if seg.duration_seconds < 5 or seg.duration_seconds > 15:
                 errors.append(f"段 {seg.segment_index} 时长 {seg.duration_seconds}s 不在 5-10s 最佳区间")
             # 检查单段单角色单 element
             char_ids = [c.character_id for c in seg.characters]
             if len(char_ids) != len(set(char_ids)):
                 errors.append(f"段 {seg.segment_index} 存在重复角色")
+            # shots 非空
+            if not seg.shots:
+                errors.append(f"段 {seg.segment_index} 没有镜头（shots 为空）")
+            else:
+                shot_total = sum(s.duration_seconds for s in seg.shots)
+                if abs(shot_total - seg.duration_seconds) > 1.0:
+                    errors.append(f"段 {seg.segment_index} 镜头时长之和 {shot_total:.1f}s ≠ 段时长 {seg.duration_seconds}s")
         return errors

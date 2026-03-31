@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "openfang-toolbox": {
+      "enabled": true,
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "/home/ljj/openfang/mcp/toolbox-mcp/mcp_stdio.js"
+      ],
+      "env": {
+        "OPENFANG_HOME": "/home/ljj/openfang/.openfang",
+        "OPENFANG_API": "http://127.0.0.1:4200",
+        "OPENAI_API_KEY": "sk-23jOH71DKLOClMXEUCBJBnm8kbDgCvDdHWk5FMw1NT46Ho4P",
+        "OPENAI_BASE_URL": "https://vibecodingapi.ai/v1"
+      },
+      "description": "OpenFang toolbox MCP - world events, character state, wardrobe"
+    }
+  },
+  "skills": {}
+}
