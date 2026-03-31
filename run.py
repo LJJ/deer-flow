@@ -52,6 +52,20 @@ def _start_trace() -> str:
     return _current_trace_id
 
 
+def _end_trace(status: str = "completed") -> None:
+    """结束当前 trace（通过发送特殊 span）"""
+    if not _current_trace_id:
+        return
+    try:
+        import httpx
+        httpx.post(f"{OPENFANG_API}/api/traces/{_current_trace_id}/spans",
+                   json={"name": "_trace_complete", "status": status, "kind": "custom",
+                         "started_at": datetime.now(timezone.utc).isoformat()},
+                   timeout=5)
+    except Exception:
+        pass
+
+
 def _report_span(name: str, kind: str = "custom", input_text: str = "", output_text: str = "",
                  duration_ms: int | None = None, error: str | None = None, metadata: dict | None = None) -> None:
     """上报 span 到 OpenFang trace 系统"""
@@ -630,9 +644,11 @@ def run_once(since: str | None = None) -> dict | None:
         if result.get("success") and result.get("video_path"):
             _deliver_to_discord(result["video_path"], screenplay.get("logline", ""))
 
+        _end_trace("completed")
         return result
     except Exception:
         logger.exception("pipeline 执行失败")
+        _end_trace("error")
         return None
     finally:
         cleanup_oss_uploads()
