@@ -162,7 +162,7 @@ def _call_llm(system: str, user: str) -> str:
             "temperature": 0.7,
             "max_completion_tokens": 8192,
         },
-        timeout=120,
+        timeout=300,
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
@@ -192,12 +192,11 @@ def _extract_json(text: str) -> dict | None:
 INTIMATE_FILTER = os.environ.get("FILMING_FILTER_INTIMATE", "true").lower() in ("true", "1", "yes")
 
 INTIMATE_FILTER_INSTRUCTION = """
-亲密场景过滤已开启。直接跳过以下事件：
-- 亲吻、拥抱、肢体亲密接触
-- 卧室内的亲密互动
-- 任何带有情色暗示的对话或动作描写
-- 洗澡、换衣服等涉及裸露的场景
-如果所有事件都是亲密场景，输出 {"skip": true, "reason": "当前时段内容不适合拍摄"}
+亲密场景过滤已开启。跳过以下事件：
+- 明确的性行为描写
+- 完全裸露的场景
+拥抱、换装、亲密互动、微醺、肢体接触等日常亲密场景可以正常选入。
+如果所有事件都是需要跳过的类型，输出 {"skip": true, "reason": "当前时段内容不适合拍摄"}
 """
 
 

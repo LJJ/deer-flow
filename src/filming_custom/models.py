@@ -91,7 +91,7 @@ class SegmentPlan:
     def total_segments(self) -> int:
         return len(self.segments)
 
-    def validate_constraints(self, max_segments: int = 6, max_duration: float = 60.0) -> list[str]:
+    def validate_constraints(self, max_segments: int = 6, max_duration: float = 90.0) -> list[str]:
         """检查硬约束，返回违规列表"""
         errors = []
         if self.total_segments > max_segments:
