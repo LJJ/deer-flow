@@ -45,10 +45,12 @@ class FilmBrief:
 
 @dataclass
 class CharacterInSegment:
-    """段内角色 — 含着装信息"""
+    """段内角色 — 含着装信息（NPC 无 outfit_item_id 和 element）"""
 
     character_id: str
-    outfit_item_id: str
+    outfit_item_id: str = ""
+    is_npc: bool = False
+    display_name: str = ""  # NPC 中文名（如"陈昊"），主角留空走 CHARACTER_DISPLAY_NAMES
 
 
 @dataclass

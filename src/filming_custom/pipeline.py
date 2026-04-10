@@ -38,6 +38,9 @@ def resolve_elements(
     """
     element_list = []
     for char in segment.characters:
+        if char.is_npc:
+            # NPC 没有 element，外貌由 shot_prompt 文本描述
+            continue
         char_wardrobe = wardrobe_data.get(char.character_id, {})
         items = char_wardrobe.get("items", {})
         item = items.get(char.outfit_item_id, {})
@@ -75,6 +78,11 @@ def _replace_names(text: str, element_list: list[dict[str, str]]) -> str:
     return text
 
 
+def _get_npc_names(segment: Segment) -> list[str]:
+    """从 segment 中提取 NPC 角色的中文名（用于 prompt 约束行）"""
+    return [c.display_name or c.character_id for c in segment.characters if c.is_npc]
+
+
 def compose_prompt(segment: Segment, element_list: list[dict[str, str]]) -> str:
     """将 SegmentPlan 的 shots 结构拼成 KlingAI 中文镜头格式。
 
@@ -103,10 +111,12 @@ def compose_prompt(segment: Segment, element_list: list[dict[str, str]]) -> str:
 
     # 根据视角追加约束
     lines.append("")
+    npc_names = _get_npc_names(segment)
+    npc_note = f"以及{' '.join(npc_names)}" if npc_names else ""
     if segment.perspective == "first_person":
-        lines.append("第一人称视角，镜头是拍摄者的眼睛。角色看向镜头表示与拍摄者对话。画面中只出现上述角色，不出现其他任何人。")
+        lines.append(f"第一人称视角，镜头是拍摄者的眼睛。角色看向镜头表示与拍摄者对话。画面中只出现上述角色{npc_note}，不出现其他任何人。")
     else:
-        lines.append("电影镜头视角，角色之间自然互动，不看镜头。画面中只出现上述角色，不出现其他任何人。")
+        lines.append(f"电影镜头视角，角色之间自然互动，不看镜头。画面中只出现上述角色{npc_note}，不出现其他任何人。")
 
     return "\n".join(lines)
 

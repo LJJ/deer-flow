@@ -81,6 +81,7 @@ Lead agent 会告诉你用哪个视角。如果没有指定，默认用世界事
 {
   "time_range": {"start": "ISO8601", "end": "ISO8601"},
   "characters": ["character_id_1", "character_id_2"],
+  "npcs": [{"npc_id": "chen_hao", "name": "陈昊"}, ...],
   "location_summary": "地点概要",
   "mood": "情绪基调",
   "material_signals": {
@@ -97,6 +98,11 @@ Lead agent 会告诉你用哪个视角。如果没有指定，默认用世界事
   ],
   "narrative_summary": "一段 2-3 句话的叙事概要（角色视角，不提及公子）"
 }
+
+注意：
+- "characters" 只放主角（songyu、ziling 等有 element 的角色）
+- "npcs" 放事件中出现的 NPC（路人/配角），用 npc_id 和中文名标注。NPC 的典型 ID 格式如 chen_hao、lao_liu、li_shu 等
+- 如果事件中没有 NPC 出现，npcs 为空数组
 
 如果没有值得拍摄的内容，输出：
 {"skip": true, "reason": "说明跳过原因"}
@@ -140,11 +146,27 @@ The subagent will:
 
 <task>
 1. 仔细阅读 FilmBrief 中的事件原文，理解发生了什么
-2. 通过 MCP 工具 read_wardrobe 读取每个角色的衣橱
+2. 通过 MCP 工具 read_wardrobe 读取每个主角的衣橱
 3. 根据事件叙事中的着装描述，匹配衣橱中最接近的 item
-4. 以段为单位设计拍摄方案：先确定分段，再在段内设计镜头
-5. 输出结构化 SegmentPlan JSON
+4. **如果 FilmBrief 中有 npcs 字段且不为空**，通过 MCP 工具 query_npc_visuals 查询这些 NPC 的外貌描述
+5. 以段为单位设计拍摄方案：先确定分段，再在段内设计镜头
+6. 输出结构化 SegmentPlan JSON
 </task>
+
+<npc_handling>
+NPC（路人/配角）没有 KlingAI element，外貌不会被自动控制。处理方式：
+
+1. **获取外貌**：用 query_npc_visuals 工具查询 NPC 外貌，参数 npc_ids 传 FilmBrief 的 npcs 列表中的 npc_id
+2. **写入 shot_prompt**：在 NPC 出现的镜头中，shot_prompt 必须包含 NPC 的外貌特征描述（体型、发型、穿着等），这样 KlingAI 才知道这个人长什么样
+3. **characters 列表**：NPC 角色加入 segment 的 characters 数组，标记 is_npc: true，带 display_name（中文名），outfit_item_id 留空
+
+示例 — NPC 出现在镜头中的 shot_prompt 写法：
+"一个戴黑框眼镜、穿深灰卫衣的高瘦男生（陈昊）走过来递了杯咖啡，宋玉接过来点了点头"
+（注意：NPC 首次出现时要写外貌，后续镜头可以简略）
+
+示例 — characters 数组中的 NPC 条目：
+{"character_id": "chen_hao", "display_name": "陈昊", "is_npc": true}
+</npc_handling>
 
 <cinematographic_language>
 景别（Scale）：
@@ -227,7 +249,8 @@ prompt 编写要点：
       "aspect_ratio": "16:9",
       "transition_to_next": "hard_cut",
       "characters": [
-        {"character_id": "songyu", "outfit_item_id": "从衣橱匹配的 item_id"}
+        {"character_id": "songyu", "outfit_item_id": "从衣橱匹配的 item_id"},
+        {"character_id": "chen_hao", "display_name": "陈昊", "is_npc": true}
       ],
       "shots": [
         {
@@ -253,8 +276,10 @@ prompt 编写要点：
 
 <important>
 - shots 数组是必填的，每段至少 1 个 shot，shot 时长之和等于段时长
-- shot_prompt 用中文，写动作+表情+对话，不写衣服
+- shot_prompt 用中文，写动作+表情+对话，主角不写衣服（element 管外观）
 - 角色名用中文名（宋玉、紫灵）
+- NPC 首次出现的 shot_prompt 必须包含外貌描述（从 query_npc_visuals 获取），因为 NPC 没有 element 保障外观一致性
+- NPC 在 characters 中标记 is_npc: true + display_name，outfit_item_id 留空或不填
 - 不要编造事件，只基于 FilmBrief 中的事件原文设计
 </important>
 """,

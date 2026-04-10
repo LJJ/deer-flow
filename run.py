@@ -132,6 +132,25 @@ console.log(JSON.stringify(events));
     return json.loads(raw) if raw else []
 
 
+def read_npc_visuals(npc_ids: list[str] | None = None) -> dict:
+    """读取 NPC 外貌描述"""
+    ids_arg = json.dumps(npc_ids) if npc_ids else "null"
+    raw = _node_eval(f'''
+const {{ loadNpcRegistry, resolveNpcVisual }} = require("./mcp/toolbox-mcp/tools/npc");
+const registry = loadNpcRegistry();
+const npcIds = {ids_arg} || Object.keys(registry);
+const result = {{}};
+for (const npcId of npcIds) {{
+  const npc = registry[npcId];
+  if (!npc || (npc.status || "active") !== "active") continue;
+  const visual = resolveNpcVisual(npc);
+  result[npcId] = {{ name: npc.name, visual, speech_style: npc.speech_style || "" }};
+}}
+console.log(JSON.stringify(result));
+''')
+    return json.loads(raw) if raw else {}
+
+
 def read_wardrobe(agent_name: str) -> dict:
     """读取角色衣橱 manifest"""
     raw = _node_eval(f'''
@@ -145,27 +164,135 @@ else console.log("{{}}");
 
 # ── LLM 调用 ────────────────────────────────────────────────────────
 
-def _call_llm(system: str, user: str) -> str:
-    """调用 LLM（使用 .env 中的 OPENAI 配置）"""
-    import httpx
-
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    base_url = os.environ.get("OPENAI_BASE_URL", "https://zaoci-02-gpt-east-us2.openai.azure.com/openai/v1")
-    model = os.environ.get("FILMING_MODEL", "gpt-5.4")
-
-    resp = httpx.post(
-        f"{base_url}/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "temperature": 0.7,
-            "max_completion_tokens": 8192,
-        },
-        timeout=300,
+def _resolve_filming_chain() -> list[str]:
+    """从 llm_routing.json 读取 filming 模型链 [primary, fallback, fallback2]"""
+    import json as _json
+    routing_path = os.path.join(
+        os.environ.get("OPENFANG_HOME", os.path.expanduser("~/.openfang")),
+        "llm_routing.json",
     )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    default = os.environ.get("FILMING_MODEL", "gpt-5.4")
+    try:
+        with open(routing_path) as f:
+            slot = _json.load(f).get("slots", {}).get("filming", {})
+        chain = []
+        seen = set()
+        for key in ("primary", "fallback", "fallback2"):
+            m = slot.get(key)
+            if m and m not in seen:
+                seen.add(m)
+                chain.append(m)
+        return chain if chain else [default]
+    except Exception:
+        return [default]
+
+
+def _call_llm(system: str, user: str) -> str:
+    """调用 LLM，按 llm_routing.json 的 filming chain 逐个尝试"""
+    import httpx
+    import re
+
+    chain = _resolve_filming_chain()
+    last_err = None
+
+    for model in chain:
+        # 供应商路由（同 MCP 层逻辑）
+        if model.startswith("deepseek"):
+            api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+            base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+        elif model.startswith("MiniMax") or model.startswith("M2"):
+            api_key = os.environ.get("MINIMAX_API_KEY", "")
+            base_url = "https://api.minimaxi.chat/v1"
+        elif model.startswith("gpt-"):
+            api_key = os.environ.get("AZURE_OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+            base_url = os.environ.get("AZURE_OPENAI_BASE_URL", os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+        else:
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+            base_url = os.environ.get("OPENAI_BASE_URL", "https://vibecodingapi.ai/v1")
+
+        token_key = "max_completion_tokens" if model.startswith("gpt-5") else "max_tokens"
+        url = f"{base_url}/chat/completions"
+        logger.info("_call_llm: model=%s base_url=%s system=%d user=%d", model, base_url, len(system), len(user))
+        try:
+            resp = httpx.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    "temperature": 0.7,
+                    token_key: 8192,
+                },
+                timeout=300,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            content = body["choices"][0]["message"]["content"]
+            # Strip <think> tags (thinking model compat)
+            content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+            finish = body["choices"][0].get("finish_reason", "?")
+            comp_tokens = body.get("usage", {}).get("completion_tokens", "?")
+            logger.info("_call_llm: finish=%s content_len=%d completion_tokens=%s", finish, len(content), comp_tokens)
+            return content
+        except Exception as e:
+            last_err = e
+            logger.warning("_call_llm: %s failed (%s), trying next", model, e)
+            continue
+
+    raise last_err or RuntimeError("All models in filming chain failed")
+
+
+def _fix_json_quotes(text: str) -> str:
+    """修复 LLM 输出中 JSON 字符串值内部的未转义双引号。
+    策略：找到非 JSON 结构性的 "xxx" 引号对，替换为「xxx」。
+    结构性引号特征：紧跟 : [ ] { } , 或在行首。非结构性引号：出现在叙事文本中间。
+    """
+    result = []
+    in_string = False
+    escape = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if escape:
+            result.append(ch)
+            escape = False
+            i += 1
+            continue
+        if ch == '\\':
+            result.append(ch)
+            escape = True
+            i += 1
+            continue
+        if ch == '"':
+            if not in_string:
+                # 开始字符串
+                in_string = True
+                result.append(ch)
+            else:
+                # 可能是字符串结束，也可能是内嵌引号
+                # 看后面：如果紧跟 JSON 结构字符（: , } ]）或空白+结构字符，是真结束
+                rest = text[i+1:].lstrip()
+                if not rest or rest[0] in ':,}]\n':
+                    in_string = False
+                    result.append(ch)
+                else:
+                    # 内嵌引号，替换为「」
+                    # 找配对的关闭引号
+                    close = text.find('"', i + 1)
+                    if close > 0:
+                        after_close = text[close+1:].lstrip()
+                        if after_close and after_close[0] not in ':,}]\n':
+                            # 关闭引号后面也不是结构字符，两个都是内嵌引号
+                            result.append('「')
+                            result.append(text[i+1:close])
+                            result.append('」')
+                            i = close + 1
+                            continue
+                    result.append('「')
+        else:
+            result.append(ch)
+        i += 1
+    return ''.join(result)
 
 
 def _extract_json(text: str) -> dict | None:
@@ -173,17 +300,21 @@ def _extract_json(text: str) -> dict | None:
     # 先试 markdown 代码块
     m = re.search(r"```(?:json)?\s*\n([\s\S]+?)\n```", text)
     if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
+        raw = m.group(1)
+        for attempt in (raw, _fix_json_quotes(raw)):
+            try:
+                return json.loads(attempt)
+            except json.JSONDecodeError:
+                continue
     # 再试裸 JSON
     m = re.search(r"\{[\s\S]+\}", text)
     if m:
-        try:
-            return json.loads(m.group())
-        except json.JSONDecodeError:
-            pass
+        raw = m.group()
+        for attempt in (raw, _fix_json_quotes(raw)):
+            try:
+                return json.loads(attempt)
+            except json.JSONDecodeError:
+                continue
     return None
 
 
@@ -335,44 +466,176 @@ def _get_dedup_context() -> str:
 
 # ── 第一步：编剧 ─────────────────────────────────────────────────
 
+_EXPLICIT_KEYWORDS = re.compile(
+    r"骑在.*身上|高潮|夹[紧得]|喉咙里.*吟|收缩|插入|抽[送插]|射[了在]|精液|阴[道茎蒂]|乳[头首房]|奶[子头]|"
+    r"裸[体露]|光[着了]身|脱[光掉].*衣|硬[了起]|勃起|潮[吹湿]|呻吟"
+)
+
+
+def _filter_explicit(events: list[dict]) -> list[dict]:
+    """过滤掉包含明确性行为描写的事件，防止模型拒绝输出"""
+    return [e for e in events if not _EXPLICIT_KEYWORDS.search(e.get("content", ""))]
+
+
+def _segment_events(events: list[dict], gap_minutes: int = 45) -> list[dict]:
+    """用代码按时间间隔自动分段，返回摘要列表。只按大的时间间隔切，不按地点切。"""
+    if not events:
+        return []
+
+    def _parse_ts(ts: str):
+        from datetime import datetime
+        return datetime.fromisoformat(ts)
+
+    segments = []
+    cur_events = [events[0]]
+
+    for e in events[1:]:
+        prev_ts = _parse_ts(cur_events[-1]["ts"])
+        cur_ts = _parse_ts(e["ts"])
+        gap = (cur_ts - prev_ts).total_seconds() / 60
+        if gap > gap_minutes:
+            segments.append(cur_events)
+            cur_events = [e]
+        else:
+            cur_events.append(e)
+
+    if cur_events:
+        segments.append(cur_events)
+
+    # 生成摘要（保留原始事件引用）
+    summaries = []
+    _segment_event_lists = segments  # 保留完整事件列表供后续使用
+    for i, seg in enumerate(segments):
+        chars = set()
+        npcs = set()
+        locations = set()
+        types = set()
+        dialogue_turns = 0
+        first_line = ""
+        for e in seg:
+            c = e.get("character", "")
+            if c.startswith("npc:"):
+                npcs.add(c)
+            elif c:
+                chars.add(c)
+            loc = e.get("location", "")
+            if loc:
+                locations.add(loc)
+            types.add(e.get("type", ""))
+            if e.get("type") in ("speak", "npc_speak") and not first_line:
+                first_line = e.get("content", "")[:60]
+            if e.get("type") in ("speak", "npc_speak"):
+                dialogue_turns += 1
+
+        summaries.append({
+            "index": i,
+            "time_start": seg[0]["ts"],
+            "time_end": seg[-1]["ts"],
+            "event_count": len(seg),
+            "characters": sorted(chars),
+            "npcs": sorted(npcs),
+            "locations": sorted(locations),
+            "types": sorted(types),
+            "dialogue_turns": dialogue_turns,
+            "preview": first_line,
+        })
+
+    return summaries, _segment_event_lists
+
+
 def step_screenplay(events: list[dict]) -> dict | None:
-    """调 LLM 选题+编剧，直接输出完整剧本"""
+    """两步编剧：代码分段摘要 → LLM 选题 → LLM 写剧本"""
     skill = _load_skill("screenplay")
     dedup = _get_dedup_context()
 
-    system = f"你是拍摄系统的编剧。从角色的生活事件中选择值得拍的内容，写成完整的视频剧本。\n\n{skill}"
+    # 过滤性行为描写事件
     if INTIMATE_FILTER:
-        system += f"\n{INTIMATE_FILTER_INSTRUCTION}"
+        filtered = _filter_explicit(events)
+        if len(filtered) < len(events):
+            logger.info("过滤掉 %d 条性行为描写事件", len(events) - len(filtered))
+        events = filtered
 
-    # 均匀采样，覆盖全天
-    if len(events) > 80:
-        step = len(events) / 80
-        sampled = [events[int(i * step)] for i in range(80)]
-    else:
-        sampled = events
+    if not events:
+        logger.info("无事件，跳过")
+        return None
 
-    events_text = json.dumps(sampled, ensure_ascii=False)
-    user = f"以下是今天的世界事件（{len(events)} 条中采样 {len(sampled)} 条，覆盖全天）：\n{events_text}"
+    # ── 第一步：代码分段 ──
+    seg_summaries, seg_event_lists = _segment_events(events)
+    logger.info("代码分段: %d 个时间段", len(seg_summaries))
+
+    # ── 第二步：LLM 选题（只看摘要）──
+    select_system = "你是拍摄系统的选题编辑。从时间段摘要中选出最适合拍成 60 秒短视频的一个时间段。\n\n直接输出 JSON，不要输出分析过程。"
+    select_user = f"以下是今天的事件时间段摘要：\n{json.dumps(seg_summaries, ensure_ascii=False, indent=2)}"
     if dedup:
-        user += f"\n\n已拍摄过的时间段（请跳过）：\n{dedup}"
+        select_user += f"\n\n已拍摄过的时间段（请跳过）：\n{dedup}"
+    if INTIMATE_FILTER:
+        select_user += f"\n{INTIMATE_FILTER_INSTRUCTION}"
+    select_user += '\n\n选一个最有故事性的时间段，输出 JSON：{"selected_index": 数字, "reason": "选择理由"}'
 
-    logger.info("编剧: %d events, calling LLM...", len(sampled))
+    logger.info("选题: %d 个时间段摘要, calling LLM...", len(seg_summaries))
     t0 = time.time()
-    result_text = _call_llm(system, user)
+    select_text = _call_llm(select_system, select_user)
+    duration = int((time.time() - t0) * 1000)
+    selection = _extract_json(select_text)
+
+    if not selection or "selected_index" not in selection:
+        _report_span("select", "llm_aux", input_text=select_user[:2000], error="selection failed", duration_ms=duration)
+        logger.error("选题失败: %s", select_text[:300])
+        return None
+
+    idx = selection["selected_index"]
+    if idx < 0 or idx >= len(seg_summaries):
+        logger.error("选题返回的 index %d 超出范围 [0, %d)", idx, len(seg_summaries))
+        return None
+
+    selected = seg_summaries[idx]
+    logger.info("选题完成: 段 %d (%s ~ %s) %d 事件, 理由: %s",
+                idx, selected["time_start"][11:19], selected["time_end"][11:19],
+                selected["event_count"], selection.get("reason", "")[:60])
+    _report_span("select", "llm_aux", input_text=select_user[:2000],
+                 output_text=json.dumps(selection, ensure_ascii=False)[:1000], duration_ms=duration)
+
+    # ── 第三步：直接用分段里的事件，LLM 写剧本 ──
+    selected_events = seg_event_lists[idx]
+    logger.info("写剧本: %d 条完整事件", len(selected_events))
+
+    screenplay_system = f"你是拍摄系统的编剧。根据以下事件写一个 60 秒以内的视频剧本。\n\n直接输出 JSON，不要输出分析过程。\n\n{skill}"
+    if INTIMATE_FILTER:
+        screenplay_system += f"\n{INTIMATE_FILTER_INSTRUCTION}"
+
+    screenplay_user = f"以下是选中时间段的完整事件：\n{json.dumps(selected_events, ensure_ascii=False)}"
+
+    t0 = time.time()
+    result_text = _call_llm(screenplay_system, screenplay_user)
     duration = int((time.time() - t0) * 1000)
     result = _extract_json(result_text)
 
     if not result:
-        _report_span("screenplay", "llm_aux", input_text=user[:2000], error="JSON parse failed", duration_ms=duration)
-        logger.error("编剧返回无法解析: %s", result_text[:300])
+        _report_span("screenplay", "llm_aux", input_text=screenplay_user[:2000], error="JSON parse failed", duration_ms=duration)
+        # 尝试详细诊断解析失败原因
+        import traceback
+        m = re.search(r"```(?:json)?\s*\n([\s\S]+?)\n```", result_text)
+        if m:
+            try:
+                json.loads(m.group(1))
+            except json.JSONDecodeError as e:
+                logger.error("JSON 解析错误（代码块）: %s, pos=%d, around: %s", e.msg, e.pos, m.group(1)[max(0,e.pos-50):e.pos+50])
+        m2 = re.search(r"\{[\s\S]+\}", result_text)
+        if m2:
+            try:
+                json.loads(m2.group())
+            except json.JSONDecodeError as e:
+                logger.error("JSON 解析错误（裸JSON）: %s, pos=%d, around: %s", e.msg, e.pos, m2.group()[max(0,e.pos-50):e.pos+50])
+        logger.error("编剧返回无法解析（前500字符）: %s", result_text[:500])
         return None
 
     if result.get("skip"):
-        _report_span("screenplay", "llm_aux", input_text=user[:2000], output_text=f"skip: {result.get('reason','')}", duration_ms=duration)
+        _report_span("screenplay", "llm_aux", output_text=f"skip: {result.get('reason','')}", duration_ms=duration)
         logger.info("编剧: skip — %s", result.get("reason", ""))
         return None
 
-    _report_span("screenplay", "llm_aux", input_text=user[:2000], output_text=json.dumps(result, ensure_ascii=False)[:5000], duration_ms=duration,
+    _report_span("screenplay", "llm_aux", input_text=screenplay_user[:2000],
+                 output_text=json.dumps(result, ensure_ascii=False)[:5000], duration_ms=duration,
                  metadata={"logline": result.get("logline",""), "segments": len(result.get("segments",[]))})
     logger.info("编剧完成: %s | %d segments", result.get("logline", "")[:80], len(result.get("segments", [])))
     return result
@@ -380,26 +643,42 @@ def step_screenplay(events: list[dict]) -> dict | None:
 
 # ── 第二步：摄影设计 ──────────────────────────────────────────────
 
-def step_cinematography(screenplay: dict, wardrobe_summary: dict) -> dict | None:
+def step_cinematography(screenplay: dict, wardrobe_summary: dict, npc_visuals: dict | None = None) -> dict | None:
     """调 LLM 按剧本设计分镜，输出 SegmentPlan"""
     cinematography_skill = _load_skill("cinematography")
     kling_skill = _load_skill("kling-constraints")
 
-    system = f"你是拍摄系统的摄影师。根据编剧写好的剧本，设计每段的具体分镜。\n\n{cinematography_skill}\n\n{kling_skill}"
+    system = f"你是拍摄系统的摄影师。根据编剧写好的剧本，设计每段的具体分镜。\n\n直接输出 JSON，不要输出分析过程或思考内容。\n\n{cinematography_skill}\n\n{kling_skill}"
 
     user = f"""编剧剧本：
 {json.dumps(screenplay, ensure_ascii=False, indent=2)}
 
 各角色衣橱（用于匹配 outfit_item_id）:
-{json.dumps(wardrobe_summary, ensure_ascii=False, indent=2)}
+{json.dumps(wardrobe_summary, ensure_ascii=False, indent=2)}"""
 
-按剧本设计每段分镜，输出 SegmentPlan JSON。"""
+    if npc_visuals:
+        user += f"""
+
+NPC 外貌信息（NPC 没有 element，外貌必须写在 shot_prompt 中）:
+{json.dumps(npc_visuals, ensure_ascii=False, indent=2)}"""
+
+    user += "\n\n按剧本设计每段分镜，输出 SegmentPlan JSON。"
 
     logger.info("摄影设计: calling LLM...")
     t0 = time.time()
     result_text = _call_llm(system, user)
     duration = int((time.time() - t0) * 1000)
     result = _extract_json(result_text)
+
+    # 容错：Opus 有时会把 segments 包在 story 或其他 key 里
+    if result and "segments" not in result:
+        for v in result.values():
+            if isinstance(v, dict) and "segments" in v:
+                result = v
+                break
+            elif isinstance(v, list) and v and isinstance(v[0], dict) and "shots" in v[0]:
+                result = {"segments": v}
+                break
 
     if not result or "segments" not in result:
         _report_span("cinematography", "llm_aux", input_text=user[:2000], error="invalid response", duration_ms=duration)
@@ -443,30 +722,43 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
                 dur = f"{int(shot.get('duration_seconds', 5))}s"
                 lines.append(f"镜头{shot.get('shot_index', 0) + 1}，{dur}，{shot.get('scale', '')}，{shot.get('shot_prompt', '')}")
 
-            # 视角约束
+            # 视角约束（NPC 名字也要列入允许出现的角色）
             perspective = seg.get("perspective", "first_person")
+            npc_names = [c.get("display_name", c.get("character_id", "")) for c in seg.get("characters", []) if c.get("is_npc")]
+            npc_note = f"以及{' '.join(npc_names)}" if npc_names else ""
             lines.append("")
             if perspective == "first_person":
-                lines.append("第一人称视角，镜头是拍摄者的眼睛。角色看向镜头表示与拍摄者对话。画面中只出现上述角色，不出现其他任何人。")
+                lines.append(f"第一人称视角，镜头是拍摄者的眼睛。角色看向镜头表示与拍摄者对话。画面中只出现上述角色{npc_note}，不出现其他任何人。")
             else:
-                lines.append("电影镜头视角，角色之间自然互动，不看镜头。画面中只出现上述角色，不出现其他任何人。")
+                lines.append(f"电影镜头视角，角色之间自然互动，不看镜头。画面中只出现上述角色{npc_note}，不出现其他任何人。")
 
             prompt = "\n".join(lines)
 
             # 收集角色参考图（定妆照）→ 上传 OSS 拿 URL
+            # 同时记录角色名↔图片序号的对应关系，用于在 prompt 中声明身份
             ref_images = []
+            ref_char_names = []  # 与 ref_images 一一对应
             for char in seg.get("characters", []):
                 char_id = char.get("character_id", "")
                 item_id = char.get("outfit_item_id", "")
+                display_name = char.get("display_name", char_id)
                 if char_id and item_id:
                     base_img = os.path.join(OPENFANG_HOME, "agents", char_id, "wardrobe", item_id, "base.png")
                     if os.path.exists(base_img):
                         try:
                             url = upload_to_oss(base_img, kind="images")
                             ref_images.append(url)
+                            ref_char_names.append(display_name)
                             logger.info("  角色参考图: %s/%s → %s", char_id, item_id, url)
                         except Exception as e:
                             logger.warning("  角色参考图上传失败: %s", e)
+
+            # 身份声明前缀：告诉视频模型每张参考图对应哪个角色
+            if len(ref_char_names) > 1:
+                identity_lines = [f"图片 {i+1} 是{name}" for i, name in enumerate(ref_char_names)]
+                prompt = "\n".join(identity_lines) + "\n\n" + prompt
+            elif len(ref_char_names) == 1:
+                prompt = f"参考图是{ref_char_names[0]}\n\n" + prompt
 
             body = {
                 "provider": provider,
@@ -648,8 +940,16 @@ def run_once(since: str | None = None) -> dict | None:
             if item.get("element_id")
         ]
 
+    # 读 NPC 外貌（如果剧本中有 NPC）
+    npc_visuals = {}
+    screenplay_npcs = screenplay.get("npcs", [])
+    if screenplay_npcs:
+        npc_ids = [n["npc_id"] if isinstance(n, dict) else n for n in screenplay_npcs]
+        npc_visuals = read_npc_visuals(npc_ids)
+        logger.info("读取 %d 个 NPC 外貌: %s", len(npc_visuals), list(npc_visuals.keys()))
+
     # 第二步：摄影设计
-    segment_plan = step_cinematography(screenplay, wardrobe_summary)
+    segment_plan = step_cinematography(screenplay, wardrobe_summary, npc_visuals=npc_visuals or None)
     if not segment_plan:
         return None
 

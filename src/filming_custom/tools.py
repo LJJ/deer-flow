@@ -17,13 +17,17 @@ def parse_segment_plan(plan_json: str) -> SegmentPlan:
     data = json.loads(plan_json)
     segments = []
     for seg_data in data.get("segments", []):
-        characters = [
-            CharacterInSegment(
-                character_id=c["character_id"],
-                outfit_item_id=c["outfit_item_id"],
-            )
-            for c in seg_data.get("characters", [])
-        ]
+        characters = []
+        for c in seg_data.get("characters", []):
+            cid = c.get("character_id") or c.get("id") or c.get("npc_id") or c.get("name", "")
+            if not cid:
+                continue
+            characters.append(CharacterInSegment(
+                character_id=cid,
+                outfit_item_id=c.get("outfit_item_id", ""),
+                is_npc=c.get("is_npc", False),
+                display_name=c.get("display_name", c.get("name", "")),
+            ))
         shots = [
             Shot(
                 shot_index=s.get("shot_index", i),
