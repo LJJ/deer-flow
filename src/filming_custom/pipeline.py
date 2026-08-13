@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -27,11 +28,23 @@ logger = logging.getLogger(__name__)
 # 4.1 Element 解析
 # ---------------------------------------------------------------------------
 
+def _load_avatar_element_id(character_id: str) -> str | None:
+    """读取 agents/{character_id}/avatar_element_id.txt，衣橱兜底用。"""
+    home = os.environ.get("OPENFANG_HOME", "../.openfang")
+    cache_path = Path(home) / "agents" / character_id / "avatar_element_id.txt"
+    if not cache_path.exists():
+        return None
+    val = cache_path.read_text(encoding="utf-8").strip()
+    return val or None
+
+
 def resolve_elements(
     segment: Segment,
     wardrobe_data: dict[str, Any],
 ) -> list[dict[str, str]]:
     """根据 segment 中每个角色的 outfit_item_id，从衣橱 manifest 查 element_id。
+
+    衣橱缺失时 fallback 到 avatar_element_id.txt，保证 4 角色同框时每人都有参考图。
 
     wardrobe_data: {character_id: {items: {item_id: {element_id: "..."}}}}
     返回 KlingAI element_list 格式: [{"id": element_id, "name": character_name}]
@@ -46,12 +59,21 @@ def resolve_elements(
         item = items.get(char.outfit_item_id, {})
         element_id = item.get("element_id")
         if not element_id:
-            logger.warning(
-                "element_not_found: character=%s outfit_item_id=%s",
-                char.character_id,
-                char.outfit_item_id,
-            )
-            continue
+            element_id = _load_avatar_element_id(char.character_id)
+            if element_id:
+                logger.info(
+                    "avatar_fallback: character=%s outfit_item_id=%s element=%s",
+                    char.character_id,
+                    char.outfit_item_id,
+                    element_id,
+                )
+            else:
+                logger.warning(
+                    "element_not_found: character=%s outfit_item_id=%s (no avatar fallback)",
+                    char.character_id,
+                    char.outfit_item_id,
+                )
+                continue
         element_list.append({"element_id": str(element_id), "name": char.character_id})
     return element_list
 
@@ -60,19 +82,38 @@ def resolve_elements(
 # 4.2 Prompt 组装
 # ---------------------------------------------------------------------------
 
-CHARACTER_DISPLAY_NAMES = {
-    "songyu": "宋玉",
-    "ziling": "紫灵",
-}
+_display_names_cache: dict[str, str] | None = None
+
+
+def _load_display_names() -> dict[str, str]:
+    """从 characters/registry.toml 加载 character_id → display_name 映射。
+
+    模块级缓存——首次调用读盘，后续复用。registry 变更需要重启进程才能生效。
+    """
+    global _display_names_cache
+    if _display_names_cache is not None:
+        return _display_names_cache
+
+    home = os.environ.get("OPENFANG_HOME", "../.openfang")
+    registry_path = Path(home) / "characters" / "registry.toml"
+    with registry_path.open("rb") as f:
+        data = tomllib.load(f)
+    _display_names_cache = {
+        cid: info["display_name"]
+        for cid, info in data.items()
+        if isinstance(info, dict) and "display_name" in info
+    }
+    return _display_names_cache
 
 
 def _replace_names(text: str, element_list: list[dict[str, str]]) -> str:
     """将文本中的角色名（character_id 和中文名）替换为 <<<element_N>>> 标记。"""
+    display_names = _load_display_names()
     for i, elem in enumerate(element_list, 1):
         marker = f"<<<element_{i}>>>"
         cid = elem["name"]
         text = text.replace(cid, marker)
-        display = CHARACTER_DISPLAY_NAMES.get(cid)
+        display = display_names.get(cid)
         if display:
             text = text.replace(display, marker)
     return text

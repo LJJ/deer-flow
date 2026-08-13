@@ -164,27 +164,56 @@ else console.log("{{}}");
 
 # ── LLM 调用 ────────────────────────────────────────────────────────
 
-def _resolve_filming_chain() -> list[str]:
-    """从 llm_routing.json 读取 filming 模型链 [primary, fallback, fallback2]"""
+def _load_routing_config() -> dict:
+    """读取 llm_routing.json 完整配置（含 slots + providers）"""
     import json as _json
     routing_path = os.path.join(
         os.environ.get("OPENFANG_HOME", os.path.expanduser("~/.openfang")),
         "llm_routing.json",
     )
-    default = os.environ.get("FILMING_MODEL", "gpt-5.4")
     try:
         with open(routing_path) as f:
-            slot = _json.load(f).get("slots", {}).get("filming", {})
-        chain = []
-        seen = set()
-        for key in ("primary", "fallback", "fallback2"):
-            m = slot.get(key)
-            if m and m not in seen:
-                seen.add(m)
-                chain.append(m)
-        return chain if chain else [default]
+            return _json.load(f)
     except Exception:
-        return [default]
+        return {}
+
+
+def _resolve_filming_chain() -> list[str]:
+    """从 llm_routing.json 读取 filming 模型链 [primary, fallback, fallback2]"""
+    config = _load_routing_config()
+    slot = config.get("slots", {}).get("filming", {})
+    default = os.environ.get("FILMING_MODEL", "gpt-5.4")
+    chain = []
+    seen = set()
+    for key in ("primary", "fallback", "fallback2"):
+        m = slot.get(key)
+        if m and m not in seen:
+            seen.add(m)
+            chain.append(m)
+    return chain if chain else [default]
+
+
+def _resolve_provider(model: str) -> tuple[str, str]:
+    """从 llm_routing.json providers 按前缀匹配解析 api_key + base_url"""
+    config = _load_routing_config()
+    providers = config.get("providers", {})
+
+    # 按 prefixes 匹配
+    for pname, pconf in providers.items():
+        for prefix in pconf.get("prefixes", []):
+            if model.startswith(prefix):
+                api_key_env = pconf.get("api_key_env", "OPENAI_API_KEY")
+                api_key = os.environ.get(api_key_env, "")
+                # base_url: 直接值 > env var > 空
+                base_url = pconf.get("base_url") or os.environ.get(pconf.get("base_url_env", ""), "")
+                return api_key, base_url
+
+    # 默认 vibecoding
+    vibe = providers.get("vibecoding", {})
+    return (
+        os.environ.get(vibe.get("api_key_env", "OPENAI_API_KEY"), ""),
+        vibe.get("base_url", "https://vibecodingapi.ai/v1"),
+    )
 
 
 def _call_llm(system: str, user: str) -> str:
@@ -196,19 +225,7 @@ def _call_llm(system: str, user: str) -> str:
     last_err = None
 
     for model in chain:
-        # 供应商路由（同 MCP 层逻辑）
-        if model.startswith("deepseek"):
-            api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-            base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-        elif model.startswith("MiniMax") or model.startswith("M2"):
-            api_key = os.environ.get("MINIMAX_API_KEY", "")
-            base_url = "https://api.minimaxi.chat/v1"
-        elif model.startswith("gpt-"):
-            api_key = os.environ.get("AZURE_OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
-            base_url = os.environ.get("AZURE_OPENAI_BASE_URL", os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"))
-        else:
-            api_key = os.environ.get("OPENAI_API_KEY", "")
-            base_url = os.environ.get("OPENAI_BASE_URL", "https://vibecodingapi.ai/v1")
+        api_key, base_url = _resolve_provider(model)
 
         token_key = "max_completion_tokens" if model.startswith("gpt-5") else "max_tokens"
         url = f"{base_url}/chat/completions"
@@ -333,6 +350,8 @@ INTIMATE_FILTER_INSTRUCTION = """
 
 # ── OSS 上传 ─────────────────────────────────────────────────────
 
+# 上传走本地直连（避免 nginx 限制），下载 URL 用公网域名（供外部 API 访问）
+OSS_UPLOAD_INTERNAL_URL = os.environ.get("OSS_UPLOAD_INTERNAL_URL", "http://127.0.0.1:4390")
 OSS_UPLOAD_BASE_URL = os.environ.get("OSS_UPLOAD_BASE_URL", "http://127.0.0.1:4390")
 OSS_UPLOAD_TOKEN = os.environ.get("OSS_UPLOAD_TOKEN", "")
 _oss_uploaded_files: list[str] = []  # 跟踪上传的文件，pipeline 结束后清理
@@ -356,7 +375,7 @@ def upload_to_oss(file_path: str, kind: str = "images") -> str:
         headers["Authorization"] = f"Bearer {OSS_UPLOAD_TOKEN}"
 
     resp = httpx.post(
-        f"{OSS_UPLOAD_BASE_URL}/api/v1/uploads/files",
+        f"{OSS_UPLOAD_INTERNAL_URL}/api/v1/uploads/files",
         files=files,
         data=data,
         headers=headers,
@@ -370,8 +389,8 @@ def upload_to_oss(file_path: str, kind: str = "images") -> str:
     url = result["data"].get("url", "")
     stored_path = result["data"].get("stored_path", "")
     # 替换本地地址为公网地址
-    public_base = os.environ.get("OSS_PUBLIC_BASE_URL", "http://www.lujiji.com")
-    url = url.replace(OSS_UPLOAD_BASE_URL, public_base)
+    if OSS_UPLOAD_INTERNAL_URL != OSS_UPLOAD_BASE_URL:
+        url = url.replace(OSS_UPLOAD_INTERNAL_URL, OSS_UPLOAD_BASE_URL)
     # 记录用于后续清理
     if stored_path:
         _oss_uploaded_files.append(stored_path)
@@ -402,53 +421,73 @@ def cleanup_oss_uploads() -> None:
 
 # ── Discord 投递 ─────────────────────────────────────────────────
 
+def _resolve_forum_thread() -> str:
+    """从 thread_zones.json 查找角色当前位置对应的 forum post thread ID。"""
+    import json as _json
+
+    openfang_home = os.environ.get("OPENFANG_HOME", "")
+    if not openfang_home:
+        openfang_home = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".openfang")
+
+    # 读角色当前位置
+    location = ""
+    try:
+        state_file = os.path.join(openfang_home, "characters", "songyu", "state.json")
+        with open(state_file) as f:
+            location = _json.load(f).get("location", "")
+    except Exception:
+        pass
+
+    # 查 thread_zones.json
+    try:
+        zones_file = os.path.join(openfang_home, "world", "thread_zones.json")
+        with open(zones_file) as f:
+            threads = _json.load(f).get("threads", {})
+        if location and location in threads:
+            return threads[location]
+        # fallback 到公共位置
+        if "公共位置" in threads:
+            return threads["公共位置"]
+    except Exception:
+        pass
+
+    return ""
+
+
 def _deliver_to_discord(video_path: str, caption: str = "") -> None:
-    """将成片投递到 Discord 世界频道"""
+    """将成片投递到 Discord 世界频道（forum channel → 位置 thread）"""
     import httpx
 
     gateway_url = os.environ.get("DISCORD_GATEWAY_URL", "http://127.0.0.1:4320")
     gateway_token = os.environ.get("GATEWAY_TOKEN", os.environ.get("DISCORD_GATEWAY_TOKEN", ""))
-    world_channel_id = os.environ.get("DISCORD_WORLD_CHANNEL_ID", "")
 
-    if not world_channel_id:
-        logger.warning("DISCORD_WORLD_CHANNEL_ID not set, skipping delivery")
+    # Forum channel：投递到角色位置对应的 forum post thread
+    thread_id = _resolve_forum_thread()
+    if not thread_id:
+        # fallback：尝试直接用 world channel ID（非 forum 场景或 thread 未创建）
+        thread_id = os.environ.get("DISCORD_WORLD_CHANNEL_ID", "")
+    if not thread_id:
+        logger.warning("无法确定投递目标 thread，skipping delivery")
         return
 
     try:
-        import subprocess as _sp
-        import tempfile as _tf
-
         headers = {"Content-Type": "application/json"}
         if gateway_token:
             headers["Authorization"] = f"Bearer {gateway_token}"
 
-        # Discord 非 Nitro 限制 8MB，压缩后投递
-        send_path = video_path
-        file_size = os.path.getsize(video_path)
-        if file_size > 7 * 1024 * 1024:  # > 7MB 就压缩
-            compressed = _tf.mktemp(suffix=".mp4", prefix="film_discord_")
-            _sp.run([
-                "ffmpeg", "-y", "-i", video_path,
-                "-c:v", "libx264", "-crf", "28", "-preset", "fast",
-                "-c:a", "aac", "-b:a", "64k", compressed,
-            ], check=True, capture_output=True)
-            send_path = compressed
-            logger.info("视频压缩: %dMB → %dMB", file_size // (1024*1024), os.path.getsize(compressed) // (1024*1024))
-
         resp = httpx.post(
             f"{gateway_url}/api/messages/send-video",
-            json={"receive_id": world_channel_id, "video_path": send_path},
+            json={"receive_id": thread_id, "video_path": video_path},
             headers=headers,
             timeout=60,
         )
         resp.raise_for_status()
-        logger.info("视频已投递到世界频道: %s", send_path)
+        logger.info("视频已投递到 forum thread %s: %s", thread_id, video_path)
 
-        # 再发说明文字（如果有）
         if caption:
             httpx.post(
                 f"{gateway_url}/api/messages/send",
-                json={"receive_id": world_channel_id, "text": f"🎬 {caption}"},
+                json={"receive_id": thread_id, "text": f"🎬 {caption}"},
                 headers=headers,
                 timeout=10,
             )
@@ -543,7 +582,7 @@ def _segment_events(events: list[dict], gap_minutes: int = 45) -> list[dict]:
     return summaries, _segment_event_lists
 
 
-def step_screenplay(events: list[dict]) -> dict | None:
+def step_screenplay(events: list[dict], topic: str | None = None) -> dict | None:
     """两步编剧：代码分段摘要 → LLM 选题 → LLM 写剧本"""
     skill = _load_skill("screenplay")
     dedup = _get_dedup_context()
@@ -570,6 +609,8 @@ def step_screenplay(events: list[dict]) -> dict | None:
         select_user += f"\n\n已拍摄过的时间段（请跳过）：\n{dedup}"
     if INTIMATE_FILTER:
         select_user += f"\n{INTIMATE_FILTER_INSTRUCTION}"
+    if topic:
+        select_user += f"\n\n用户指定的主题：「{topic}」——只选择与这个主题相关的时间段。如果没有任何时间段与主题相关，返回 selected_index: -1。"
     select_user += '\n\n选一个最有故事性的时间段，输出 JSON：{"selected_index": 数字, "reason": "选择理由"}'
 
     logger.info("选题: %d 个时间段摘要, calling LLM...", len(seg_summaries))
@@ -584,6 +625,11 @@ def step_screenplay(events: list[dict]) -> dict | None:
         return None
 
     idx = selection["selected_index"]
+    if idx == -1 and topic:
+        logger.info("选题: 没有找到与「%s」相关的时间段", topic)
+        _report_span("select", "llm_aux", input_text=select_user[:2000],
+                     output_text=f"no match for topic: {topic}", duration_ms=duration)
+        return {"no_match": True, "topic": topic, "reason": selection.get("reason", "")}
     if idx < 0 or idx >= len(seg_summaries):
         logger.error("选题返回的 index %d 超出范围 [0, %d)", idx, len(seg_summaries))
         return None
@@ -697,7 +743,7 @@ MEDIA_SERVICE_URL = os.environ.get("MEDIA_SERVICE_URL", "http://127.0.0.1:4500")
 VIDEO_PROVIDER = os.environ.get("VIDEO_PROVIDER", "kling")
 
 
-def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict:
+def step_execute_via_media_service(segment_plan: dict, screenplay: dict, wardrobe_data: dict | None = None) -> dict:
     """通过 media-service HTTP API 生成视频（不依赖内部 kling_client，支持任意 provider）"""
     import httpx
     import shutil
@@ -738,20 +784,49 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
             # 同时记录角色名↔图片序号的对应关系，用于在 prompt 中声明身份
             ref_images = []
             ref_char_names = []  # 与 ref_images 一一对应
-            for char in seg.get("characters", []):
+            seg_chars = seg.get("characters", [])
+            for char in seg_chars:
                 char_id = char.get("character_id", "")
-                item_id = char.get("outfit_item_id", "")
+                if not char_id or char.get("is_npc"):
+                    continue
                 display_name = char.get("display_name", char_id)
-                if char_id and item_id:
-                    base_img = os.path.join(OPENFANG_HOME, "agents", char_id, "wardrobe", item_id, "base.png")
-                    if os.path.exists(base_img):
-                        try:
-                            url = upload_to_oss(base_img, kind="images")
-                            ref_images.append(url)
-                            ref_char_names.append(display_name)
-                            logger.info("  角色参考图: %s/%s → %s", char_id, item_id, url)
-                        except Exception as e:
-                            logger.warning("  角色参考图上传失败: %s", e)
+                item_id = char.get("outfit_item_id", "")
+
+                # 从 wardrobe 目录找 base.png
+                # base_path 在 manifest 里可能是目录路径或不准确，统一用 agents/{char_id}/wardrobe/{item_id}/base.png
+                base_img = None
+                agent_wardrobe_dir = os.path.join(OPENFANG_HOME, "agents", char_id, "wardrobe")
+
+                # 优先用摄影设计指定的 outfit
+                if item_id:
+                    candidate = os.path.join(agent_wardrobe_dir, item_id, "base.png")
+                    if os.path.exists(candidate):
+                        base_img = candidate
+
+                # fallback：从 wardrobe_data 找任意有 base.png 的 item
+                if not base_img and wardrobe_data and char_id in wardrobe_data:
+                    for iid in wardrobe_data[char_id].get("items", {}):
+                        candidate = os.path.join(agent_wardrobe_dir, iid, "base.png")
+                        if os.path.exists(candidate):
+                            base_img = candidate
+                            break
+
+                # 最终 fallback：avatar.png
+                if not base_img:
+                    avatar = os.path.join(OPENFANG_HOME, "agents", char_id, "avatar.png")
+                    if os.path.exists(avatar):
+                        base_img = avatar
+
+                if base_img:
+                    try:
+                        url = upload_to_oss(base_img, kind="images")
+                        ref_images.append(url)
+                        ref_char_names.append(display_name)
+                        logger.info("  角色参考图: %s → %s", char_id, url)
+                    except Exception as e:
+                        logger.warning("  角色参考图上传失败 %s: %s", char_id, e)
+                else:
+                    logger.warning("  角色 %s 无参考图（无 wardrobe base_path 和 avatar）", char_id)
 
             # 身份声明前缀：告诉视频模型每张参考图对应哪个角色
             if len(ref_char_names) > 1:
@@ -777,7 +852,13 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
                 resp = httpx.post(f"{MEDIA_SERVICE_URL}/video/generate", json=body, timeout=30)
                 resp.raise_for_status()
                 task_info = resp.json()
-                tasks.append({"seg": seg, "taskId": task_info["taskId"], "provider": task_info["provider"], "prompt": prompt})
+                tasks.append({
+                    "seg": seg,
+                    "taskId": task_info["taskId"],
+                    "provider": task_info["provider"],
+                    "prompt": prompt,
+                    "body": body,
+                })
             except Exception as e:
                 _report_span(f"segment_{seg.get('segment_index',0)}_submit_error", "custom", error=str(e))
                 logger.warning("segment %d 提交失败（跳过）: %s", seg.get("segment_index", 0), e)
@@ -791,12 +872,17 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
             logger.info("轮询 segment %d task=%s", task["seg"].get("segment_index", 0), task_id)
             poll_start = time.time()
 
-            for _ in range(120):  # 最多 20 分钟
+            for poll_i in range(120):  # 最多 20 分钟
                 time.sleep(10)
-                resp = httpx.get(f"{MEDIA_SERVICE_URL}/task/{task_provider}/{task_id}", timeout=30)
-                result = resp.json()
+                try:
+                    resp = httpx.get(f"{MEDIA_SERVICE_URL}/task/{task_provider}/{task_id}", timeout=30)
+                    result = resp.json()
+                except Exception as poll_err:
+                    logger.warning("  poll fetch error (%d): %s", poll_i, poll_err)
+                    continue
 
-                if result["status"] == "completed":
+                poll_status = result.get("status", "")
+                if poll_status == "completed":
                     video_url = result["result"]["url"]
                     dest = os.path.join(tmp_dir, f"segment_{task['seg'].get('segment_index', 0)}.mp4")
                     dl_resp = httpx.get(video_url, timeout=120)
@@ -809,7 +895,7 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
                                  metadata={"provider": task_provider, "task_id": task_id})
                     logger.info("segment %d 完成: %s", task["seg"].get("segment_index", 0), dest)
                     break
-                elif result["status"] == "failed":
+                elif poll_status == "failed":
                     err_msg = result.get("error", "generation failed")
                     # fallback 到 kling
                     if task_provider != "kling":
@@ -819,7 +905,7 @@ def step_execute_via_media_service(segment_plan: dict, screenplay: dict) -> dict
                                      metadata={"original_provider": task_provider, "original_task_id": task_id, "error": err_msg})
                         logger.warning("segment %d %s 失败，fallback 到 kling: %s", task["seg"].get("segment_index", 0), task_provider, err_msg)
                         try:
-                            fb_body = {**body, "provider": "kling"}
+                            fb_body = {**task["body"], "provider": "kling"}
                             fb_resp = httpx.post(f"{MEDIA_SERVICE_URL}/video/generate", json=fb_body, timeout=30)
                             fb_resp.raise_for_status()
                             fb_info = fb_resp.json()
@@ -906,13 +992,13 @@ def step_execute(segment_plan: dict, wardrobe_data: dict, screenplay: dict) -> d
 
 # ── 完整流程 ─────────────────────────────────────────────────────
 
-def run_once(since: str | None = None) -> dict | None:
+def run_once(since: str | None = None, topic: str | None = None) -> dict | None:
     """执行一次完整的拍摄流程"""
     if since is None:
         since = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
 
     _start_trace()
-    logger.info("=== 开始拍摄 (since=%s) trace=%s ===", since, _current_trace_id)
+    logger.info("=== 开始拍摄 (since=%s, topic=%s) trace=%s ===", since, topic or "(auto)", _current_trace_id)
 
     # 读数据
     events = read_world_events(since)
@@ -922,9 +1008,13 @@ def run_once(since: str | None = None) -> dict | None:
         return None
 
     # 第一步：编剧（选题+剧本）
-    screenplay = step_screenplay(events)
+    screenplay = step_screenplay(events, topic=topic)
     if not screenplay:
         return None
+    if screenplay.get("no_match"):
+        logger.info("主题「%s」无匹配素材，结束", topic)
+        _end_trace("no_match")
+        return screenplay
 
     # 读衣橱
     characters = screenplay.get("characters", [])
@@ -935,7 +1025,7 @@ def run_once(since: str | None = None) -> dict | None:
         wardrobe_data[char_id] = wd
         items = wd.get("items", {})
         wardrobe_summary[char_id] = [
-            {"id": iid, "name": item.get("name", "")[:40]}
+            {"id": iid, "name": item.get("name", "")[:40], "description": item.get("description", "")[:80]}
             for iid, item in items.items()
             if item.get("element_id")
         ]
@@ -959,7 +1049,7 @@ def run_once(since: str | None = None) -> dict | None:
         if VIDEO_PROVIDER == "kling":
             result = step_execute(segment_plan, wardrobe_data, screenplay)
         else:
-            result = step_execute_via_media_service(segment_plan, screenplay)
+            result = step_execute_via_media_service(segment_plan, screenplay, wardrobe_data=wardrobe_data)
         logger.info("=== 拍摄完成 === %s", json.dumps(result, ensure_ascii=False)[:300])
 
         # 第四步：投递到 Discord 世界频道
@@ -1003,6 +1093,7 @@ def main() -> None:
 
     once_p = sub.add_parser("once", help="单次拍摄")
     once_p.add_argument("--since", help="事件起始时间 (ISO8601)")
+    once_p.add_argument("--topic", help="拍摄主题（如「逛街」「做饭」），影响选题偏好")
 
     sched_p = sub.add_parser("schedule", help="定时调度")
     sched_p.add_argument("--interval", type=float, default=3.0, help="间隔（小时）")
@@ -1013,7 +1104,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "once":
-        run_once(args.since)
+        result = run_once(args.since, topic=getattr(args, "topic", None))
+        if result and result.get("no_match"):
+            sys.exit(2)  # 主题无匹配，gateway 据此提示用户
     elif args.command == "schedule":
         run_schedule(args.interval)
     elif args.command == "curate":
